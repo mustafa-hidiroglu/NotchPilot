@@ -5,7 +5,8 @@ import SwiftUI
 /// out of (HIG › Live Activities: "Live Activities in the Dynamic Island use a black opaque
 /// background"), so its colours are fixed dark-appearance values and contrast is constant in
 /// light and dark mode. One colour, one meaning: red = capturing, teal = audio level,
-/// yellow = needs attention. Every colour is paired with a symbol or text.
+/// yellow = needs attention. Every colour is paired with a symbol or text. Assistant rows
+/// (AssistantViews.swift) use the same tokens; teal never appears there.
 ///   primary   white 92%  on #000 → 17.6:1
 ///   secondary white 62%  on #000 →  8.0:1
 ///   live      systemRed  (#FF453A dark) on #000 → 6.2:1
@@ -71,8 +72,11 @@ struct IslandView: View {
         .accessibilityLabel("NotchPilot")
     }
 
+    /// Extra expanded height for assistant output; animated by the view model.
+    private var accessoryHeight: CGFloat { isExpanded ? model.accessoryHeight : 0 }
+
     private var island: some View {
-        let size = geometry.islandSize(for: model.presentation)
+        let size = geometry.islandSize(for: model.presentation, accessoryHeight: accessoryHeight)
         let shape = IslandShape(topRadius: geometry.topCornerRadius(for: model.presentation),
                                 bottomRadius: geometry.bottomCornerRadius(for: model.presentation),
                                 shoulderRadius: geometry.shoulderRadius)
@@ -86,11 +90,13 @@ struct IslandView: View {
             VStack(spacing: 0) {
                 header
                 if isExpanded {
+                    let expanded = geometry.islandSize(for: .expanded, accessoryHeight: model.accessoryHeight)
                     ExpandedContent(model: model)
-                        // Laid out at its final width from the first frame, so text never
-                        // re-wraps while the island grows; the clip shape reveals it.
-                        .frame(width: geometry.islandSize(for: .expanded).width - 2 * model.config.layout.contentInset,
-                               alignment: .leading)
+                        // Laid out at its final width and height from the first frame, so text
+                        // never re-wraps while the island grows; the clip shape reveals it.
+                        .frame(width: expanded.width - 2 * model.config.layout.contentInset,
+                               height: max(0, expanded.height - geometry.headerHeight - model.config.layout.contentInset),
+                               alignment: .topLeading)
                         .padding(.horizontal, model.config.layout.contentInset)
                         .padding(.bottom, model.config.layout.contentInset)
                         .transition(contentTransition)
@@ -234,10 +240,12 @@ private struct MiniMeter: View {
     }
 }
 
-/// Expanded body: status, primary action, level meter, telemetry and privacy note.
+/// Expanded body: status, primary action, level meter, live transcript, Ask row, assistant
+/// output, telemetry and privacy note.
 private struct ExpandedContent: View {
     @Bindable var model: IslandViewModel
     @FocusState private var primaryFocused: Bool
+    @FocusState private var questionFocused: Bool
     @Environment(\.colorSchemeContrast) private var contrast
 
     private var secondary: Color {
@@ -265,6 +273,15 @@ private struct ExpandedContent: View {
 
             LevelBar(snapshot: model.level, active: isRunning)
 
+            TranscriptRow(model: model)
+
+            AskRow(model: model, questionFocused: $questionFocused)
+
+            if model.askPhase != .idle {
+                AskOutput(model: model, height: outputHeight)
+                    .transition(.opacity)
+            }
+
             HStack(spacing: 0) {
                 if model.config.features.showTelemetry {
                     Text(telemetry)
@@ -272,17 +289,28 @@ private struct ExpandedContent: View {
                         .accessibilityLabel(telemetryAccessibility)
                 }
                 Spacer(minLength: 8)
-                Label("In memory only, never saved", systemImage: "lock.fill")
+                Label("Transcribed on this Mac · Sent only when you Ask", systemImage: "lock.fill")
                     .labelStyle(.titleAndIcon)
+                    .help("Audio, transcripts and screenshots stay in memory and are never saved. Ask sends one request to \(model.provider.displayName).")
             }
             .font(.system(size: 11, weight: .medium))
             .foregroundStyle(secondary)
+            // Pinned to the bottom edge of the fixed-height content (no extra stack gap).
+            .frame(maxHeight: .infinity, alignment: .bottom)
         }
     }
 
     private var isRunning: Bool {
         if case .running = model.captureState { return true }
         return false
+    }
+
+    /// Final height of the output container (its share of the accessory height, minus the
+    /// stack spacing above it).
+    private var outputHeight: CGFloat {
+        let layout = model.config.layout
+        let accessory = if case .replied = model.askPhase { layout.expandedReplyHeight } else { layout.expandedNoticeHeight }
+        return accessory - 10
     }
 
     private var headline: String {
@@ -331,8 +359,9 @@ private struct ExpandedContent: View {
             }
         }
         // Return triggers the primary action when the panel is key ("Show Controls"), and
-        // keyboard focus lands on it so Space works too.
-        .keyboardShortcut(.defaultAction)
+        // keyboard focus lands on it so Space works too. While the question field has focus,
+        // Return belongs to the field (it asks).
+        .keyboardShortcut(questionFocused ? nil : .defaultAction)
         .focused($primaryFocused)
         .onAppear { primaryFocused = true }
     }

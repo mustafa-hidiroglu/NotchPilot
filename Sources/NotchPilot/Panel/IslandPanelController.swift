@@ -85,6 +85,12 @@ final class IslandPanelController: IslandPanelHosting {
         if presentation == .compact { setPanelFrame(for: .compact) }
     }
 
+    func accessoryHeightDidChange() {
+        // Only the expanded island shows assistant output; a compact panel keeps its size.
+        guard model.presentation == .expanded || model.hasPendingTransition else { return }
+        setPanelFrame(for: .expanded)
+    }
+
     /// Makes the panel key for keyboard use (only on explicit user request). Because the
     /// panel is non-activating, the frontmost app stays active.
     func focusForKeyboard() {
@@ -104,7 +110,7 @@ final class IslandPanelController: IslandPanelHosting {
     }
 
     private func setPanelFrame(for presentation: IslandPresentation) {
-        let frame = model.geometry.panelFrame(for: presentation)
+        let frame = model.geometry.panelFrame(for: presentation, accessoryHeight: model.panelAccessoryHeight)
         guard frame != panel.frame else { return }
         panel.setFrame(frame, display: true, animate: false)
     }

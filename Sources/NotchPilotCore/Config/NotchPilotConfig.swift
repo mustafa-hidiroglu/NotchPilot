@@ -13,8 +13,13 @@ public struct NotchPilotConfig: Sendable, Equatable {
         public var compactSizeWithoutNotch = CGSize(width: 200, height: 32)
         /// Fallback compact height when a notched display reports no safe-area inset.
         public var minimumNotchHeight: CGFloat = 32
-        /// Expanded content area, measured below the camera housing / top edge.
-        public var expandedContentSize = CGSize(width: 440, height: 132)
+        /// Expanded content area, measured below the camera housing / top edge: capture
+        /// status, level bar, live transcript, Ask row and footer.
+        public var expandedContentSize = CGSize(width: 460, height: 208)
+        /// Extra expanded height while an Ask is in progress or has failed (one-row notice).
+        public var expandedNoticeHeight: CGFloat = 74
+        /// Extra expanded height while a reply is shown (about five lines of text).
+        public var expandedReplyHeight: CGFloat = 140
         /// Bottom corner radius in compact and expanded states.
         public var compactCornerRadius: CGFloat = 12
         public var expandedCornerRadius: CGFloat = 24

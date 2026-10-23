@@ -10,6 +10,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         var showControls: () -> Void
         var toggleCapture: () -> Void
         var openPrivacySettings: () -> Void
+        var openSettings: () -> Void
+        var clearTranscript: () -> Void
+        var ask: () -> Void
+        var askTitle: () -> String
+        var isAsking: () -> Bool
+        var hasTranscript: () -> Bool
         var isIslandVisible: () -> Bool
         var captureState: () -> CaptureState
     }
@@ -22,6 +28,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         super.init()
         let menu = NSMenu()
         menu.delegate = self
+        menu.autoenablesItems = false   // enabled state is set explicitly in menuNeedsUpdate
         statusItem.menu = menu
         update(for: .idle)
     }
@@ -54,7 +61,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(item(state.isActive ? "Stop Capture" : "Start Capture", key: "r", action: #selector(toggleCapture)))
         menu.addItem(item("Show Controls", key: "", action: #selector(showControls)))
         menu.addItem(item(actions.isIslandVisible() ? "Hide Island" : "Show Island", key: "", action: #selector(toggleIsland)))
+        let ask = item(actions.askTitle(), key: "", action: #selector(askAssistant))
+        ask.isEnabled = !actions.isAsking()
+        menu.addItem(ask)
+        let clear = item("Clear Transcript", key: "", action: #selector(clearTranscript))
+        clear.isEnabled = actions.hasTranscript()
+        menu.addItem(clear)
         menu.addItem(.separator())
+        // Ellipsis: opens a window that needs more input (HIG › Menus).
+        menu.addItem(item("Settings…", key: ",", action: #selector(openSettings)))
         menu.addItem(item("Open Privacy Settings", key: "", action: #selector(openPrivacySettings)))
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit NotchPilot", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -81,4 +96,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func showControls() { actions.showControls() }
     @objc private func toggleIsland() { actions.toggleIsland() }
     @objc private func openPrivacySettings() { actions.openPrivacySettings() }
+    @objc private func openSettings() { actions.openSettings() }
+    @objc private func clearTranscript() { actions.clearTranscript() }
+    @objc private func askAssistant() { actions.ask() }
 }

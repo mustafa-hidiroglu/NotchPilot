@@ -54,7 +54,10 @@ public struct IslandGeometry: Sendable, Equatable {
     }
 
     /// Size of the visible island shape for a presentation, clamped to the display.
-    public func islandSize(for presentation: IslandPresentation) -> CGSize {
+    /// `accessoryHeight` is extra expanded height for assistant output (see
+    /// `NotchPilotConfig.Layout.expandedNoticeHeight` / `expandedReplyHeight`); it is
+    /// ignored in compact presentation.
+    public func islandSize(for presentation: IslandPresentation, accessoryHeight: CGFloat = 0) -> CGSize {
         let maxWidth = max(0, display.visibleFrame.width - 2 * (config.shadowMargin + shoulderRadius))
         let size: CGSize
         switch presentation {
@@ -65,16 +68,18 @@ public struct IslandGeometry: Sendable, Equatable {
         case .expanded:
             let width = max(config.expandedContentSize.width,
                             attachedToNotch ? display.notchWidth + 2 * config.compactWingWidth : 0)
-            size = CGSize(width: width, height: headerHeight + config.expandedContentSize.height)
+            size = CGSize(width: width, height: headerHeight + config.expandedContentSize.height + max(0, accessoryHeight))
         }
-        return CGSize(width: min(size.width, maxWidth), height: size.height)
+        let maxHeight = max(0, (attachedToNotch ? display.frame.maxY : display.visibleFrame.maxY - config.floatingTopMargin)
+                               - display.visibleFrame.minY - config.shadowMargin)
+        return CGSize(width: min(size.width, maxWidth), height: min(size.height, maxHeight))
     }
 
     /// Panel frame (global coordinates) that hosts the island for a presentation:
     /// horizontally centred on the display, top edge pinned, padded for the shadow, and
     /// never outside the screen frame.
-    public func panelFrame(for presentation: IslandPresentation) -> CGRect {
-        let island = islandSize(for: presentation)
+    public func panelFrame(for presentation: IslandPresentation, accessoryHeight: CGFloat = 0) -> CGRect {
+        let island = islandSize(for: presentation, accessoryHeight: accessoryHeight)
         // Shoulders flare outside the island body; the shadow margin covers them.
         let width = island.width + 2 * (config.shadowMargin + shoulderRadius)
         let height = island.height + config.shadowMargin

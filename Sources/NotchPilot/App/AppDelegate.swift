@@ -1,20 +1,37 @@
 import AppKit
 import NotchPilotCore
 
-/// Wires the capture service, island and status item together on the main actor.
+/// Wires the capture service, transcriber, assistant, island, settings window and status item
+/// together on the main actor.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let config = NotchPilotConfig.default
     private var service: AudioCaptureService?
+    /// Strong reference: the capture service holds its processor weakly.
+    private var transcriber: SystemAudioTranscriber?
+    private var settingsWindow: SettingsWindowController?
     private var model: IslandViewModel?
     private var panelController: IslandPanelController?
     private var statusItem: StatusItemController?
     private var observers: [Task<Void, Never>] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let service = AudioCaptureService(config: config)
-        let model = IslandViewModel(config: config, service: service)
+        let transcriber = SystemAudioTranscriber(locale: .current)
+        let service = AudioCaptureService(config: config, processor: transcriber)
+        let keyStore = KeychainAPIKeyStore()
+        let settingsStore = AssistantSettingsStore(keyStore: keyStore)
+        let model = IslandViewModel(config: config, service: service, transcriber: transcriber,
+                                    replyService: ReplyService(keyStore: keyStore),
+                                    screenshotter: ScreenshotCapturer(), settingsStore: settingsStore)
         let panelController = IslandPanelController(model: model, config: config)
+        let settingsWindow = SettingsWindowController(store: settingsStore)
+        model.openSettings = { [weak settingsWindow] in settingsWindow?.show() }
+        // The island's Include Screen follows the default when the default changes.
+        settingsStore.onChange = { [weak model] old, new in
+            if old.includeScreenshotByDefault != new.includeScreenshotByDefault {
+                model?.includeScreen = new.includeScreenshotByDefault
+            }
+        }
 
         let statusItem = StatusItemController(actions: .init(
             toggleIsland: { [weak panelController] in
@@ -28,6 +45,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             toggleCapture: { [weak model] in model?.toggleCapture() },
             openPrivacySettings: { [weak model] in model?.openPrivacySettings() },
+            openSettings: { [weak settingsWindow] in settingsWindow?.show() },
+            clearTranscript: { [weak model] in model?.clearTranscript() },
+            ask: { [weak panelController, weak model] in
+                // Shows the island so the progress and reply are visible.
+                panelController?.show()
+                model?.setPresentation(.expanded)
+                model?.ask()
+            },
+            askTitle: { [weak model] in "Ask \(model?.provider.displayName ?? "")" },
+            isAsking: { [weak model] in model?.askPhase.isBusy ?? false },
+            hasTranscript: { [weak model] in !(model?.transcript.fullText.isEmpty ?? true) },
             isIslandVisible: { [weak panelController] in panelController?.isVisible ?? false },
             captureState: { [weak model] in model?.captureState ?? .idle }))
 
@@ -35,8 +63,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // fed from non-real-time code only.
         observers.append(Task { [weak model, weak statusItem] in
             for await state in service.states {
-                model?.captureState = state
+                model?.captureStateDidChange(to: state)
                 statusItem?.update(for: state)
+            }
+        })
+        observers.append(Task { [weak model] in
+            for await state in transcriber.states {
+                model?.transcriptionState = state
+            }
+        })
+        observers.append(Task { [weak model] in
+            for await transcript in transcriber.transcripts {
+                model?.transcript = transcript
             }
         })
         observers.append(Task { [weak model] in
@@ -46,10 +84,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         })
 
         self.service = service
+        self.transcriber = transcriber
+        self.settingsWindow = settingsWindow
         self.model = model
         self.panelController = panelController
         self.statusItem = statusItem
+        MainMenu.install(settingsTarget: self, settingsAction: #selector(showSettings))
         panelController.show()   // capture stays off until the person starts it
+    }
+
+    @objc private func showSettings() {
+        settingsWindow?.show()
     }
 
     /// Stops capture before quitting so the stream is torn down in order. If

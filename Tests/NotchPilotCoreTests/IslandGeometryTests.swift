@@ -73,6 +73,19 @@ struct IslandGeometryTests {
         #expect(size.width == layout.expandedContentSize.width)
     }
 
+    @Test("assistant output adds height to the expanded island only")
+    func accessoryHeight() {
+        let geometry = IslandGeometry(config: layout, display: notched, attachToNotch: true)
+        let base = geometry.islandSize(for: .expanded)
+        let withReply = geometry.islandSize(for: .expanded, accessoryHeight: layout.expandedReplyHeight)
+        #expect(withReply.height == base.height + layout.expandedReplyHeight)
+        #expect(withReply.width == base.width)
+        #expect(geometry.islandSize(for: .compact, accessoryHeight: 100) == geometry.islandSize(for: .compact))
+        let frame = geometry.panelFrame(for: .expanded, accessoryHeight: layout.expandedReplyHeight)
+        #expect(frame.maxY == notched.frame.maxY)
+        #expect(frame.height == withReply.height + layout.shadowMargin)
+    }
+
     // MARK: Panel frame
 
     @Test("attached panel is centred and pinned to the physical top edge",
