@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Deliberately no privacy usage-description keys (NSMicrophoneUsageDescription,
+  NSCameraUsageDescription, ...): NotchPilot captures system audio through
+  ScreenCaptureKit, whose "Screen & System Audio Recording" permission has no
+  Info.plist key (macOS shows its own prompt), and the app never touches the
+  microphone or camera.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>app.notchpilot.NotchPilot</string>
+    <key>CFBundleName</key>
+    <string>NotchPilot</string>
+    <key>CFBundleDisplayName</key>
+    <string>NotchPilot</string>
+    <key>CFBundleExecutable</key>
+    <string>NotchPilot</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 NotchPilot. All rights reserved.</string>
+</dict>
+</plist>
