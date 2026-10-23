@@ -41,6 +41,9 @@ public final class SystemAudioTranscriber: PCMBlockProcessor, @unchecked Sendabl
     /// A task that fails sooner than this without producing text counts as a fast failure.
     private static let fastFailureWindow: Double = 2
     private static let maxFastFailures = 5
+    /// Task rotation bounds (see `append`).
+    private static let maxTaskDuration: Double = 55
+    private static let maxPartialCharacters = 4_000
 
     private let queue = DispatchQueue(label: "app.notchpilot.speech", qos: .userInitiated)
     private let locale: Locale
@@ -193,6 +196,15 @@ public final class SystemAudioTranscriber: PCMBlockProcessor, @unchecked Sendabl
                 beginTask()
             }
         }
+        // On-device tasks have no server time limit, so on continuous audio one task (its
+        // buffered audio and ever-growing partial result) could live indefinitely. Rotate it
+        // after a fixed duration or once the partial text gets long.
+        let taskAge = Double(DispatchTime.now().uptimeNanoseconds - taskStartedAt.uptimeNanoseconds) / 1e9
+        if taskAge > Self.maxTaskDuration || transcript.partialText.count > Self.maxPartialCharacters {
+            endTask()
+            commitPartial()
+            beginTask()
+        }
         guard let audioFormat,
               let buffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: AVAudioFrameCount(mono.count)),
               let channel = buffer.floatChannelData?[0] else { return }
@@ -237,7 +249,8 @@ public final class SystemAudioTranscriber: PCMBlockProcessor, @unchecked Sendabl
                 fastFailures = 0
             }
             transcript.partialText = update.text
-            guard update.isFinal else {
+            // A result delivered together with an error means the task is over, too.
+            guard update.isFinal || failed else {
                 transcriptsContinuation.yield(transcript)
                 return
             }
@@ -247,7 +260,11 @@ public final class SystemAudioTranscriber: PCMBlockProcessor, @unchecked Sendabl
             // Task ended without a final result (silence timeout, interruption…). Keep what
             // was heard and carry on, unless tasks keep failing straight away.
             let lifetime = Double(DispatchTime.now().uptimeNanoseconds - taskStartedAt.uptimeNanoseconds) / 1e9
-            if !taskProducedText && lifetime < Self.fastFailureWindow { fastFailures += 1 }
+            if lifetime >= Self.fastFailureWindow {
+                fastFailures = 0          // only consecutive immediate failures count
+            } else if !taskProducedText {
+                fastFailures += 1
+            }
             commitPartial()
             if fastFailures >= Self.maxFastFailures {
                 gate.withLock { $0.listening = false }

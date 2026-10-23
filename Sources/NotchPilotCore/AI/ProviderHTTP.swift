@@ -3,7 +3,9 @@ import Foundation
 /// HTTP plumbing shared by `ClaudeClient` and `OpenAIClient`. Never logs keys, transcripts
 /// or bodies.
 enum ProviderHTTP {
-    static let timeout: TimeInterval = 120
+    /// Replies are non-streaming, so no bytes arrive until generation finishes; this idle
+    /// timeout must cover a long reply at higher effort.
+    static let timeout: TimeInterval = 600
 
     /// Ephemeral, cache-free session: nothing about a request is written to disk.
     static let defaultSession: URLSession = {
@@ -61,13 +63,14 @@ enum ProviderHTTP {
             let retryAfter = response.value(forHTTPHeaderField: "retry-after")
                 .flatMap { Double($0.trimmingCharacters(in: .whitespaces)) }
             return .rateLimited(provider, retryAfterSeconds: retryAfter)
-        case 500, 502, 503, 529:
+        case 408, 500, 502, 503, 504, 529:
             return .providerUnavailable(provider, status: status)
         default:
             // Both providers wrap errors as {"error": {"message": ...}}.
             let message = (try? JSONDecoder().decode(ErrorEnvelope.self, from: body))?.error.message
                 ?? HTTPURLResponse.localizedString(forStatusCode: status)
-            return .requestRejected(provider, status: status, message: message)
+            // Shown only as a tooltip; capped so a verbose error body can't flood the UI.
+            return .requestRejected(provider, status: status, message: String(message.prefix(200)))
         }
     }
 

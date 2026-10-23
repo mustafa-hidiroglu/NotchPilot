@@ -3,7 +3,8 @@ import Foundation
 /// OpenAI Chat Completions client.
 public struct OpenAIClient: ReplyGenerating {
     public static let endpoint = URL(string: "https://api.openai.com/v1/chat/completions")!
-    static let maxCompletionTokens = 4_096
+    /// Includes reasoning tokens on reasoning models, so it must leave room for the answer.
+    static let maxCompletionTokens = 16_000
 
     public let provider = AIProvider.openAI
     private let session: URLSession
@@ -23,7 +24,10 @@ public struct OpenAIClient: ReplyGenerating {
               let choice = response.choices.first
         else { throw AssistantError.invalidResponse(provider) }
         if choice.message.refusal != nil { throw AssistantError.refused(provider) }
-        guard let text = choice.message.content else { throw AssistantError.invalidResponse(provider) }
+        // Empty content (e.g. the whole budget went to reasoning) is not a usable reply.
+        guard let text = choice.message.content,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { throw AssistantError.invalidResponse(provider) }
         return AssistantReply(text: text, provider: provider, model: response.model, truncated: choice.finishReason == "length")
     }
 

@@ -124,6 +124,7 @@ final class IslandViewModel {
     @ObservationIgnored private let replyService: ReplyService
     @ObservationIgnored private let screenshotter: any ScreenshotCapturing
     @ObservationIgnored private var askTask: Task<Void, Never>?
+    @ObservationIgnored private var currentAskID: UUID?
     @ObservationIgnored private var transitionID = 0
     @ObservationIgnored private var settledTransitionID = 0
     @ObservationIgnored private var accessoryTransitionID = 0
@@ -245,33 +246,39 @@ final class IslandViewModel {
         let screenshotter = screenshotter
         let replyService = replyService
 
+        // Busy synchronously, before the task runs, so a second Ask (Return + click, or the
+        // menu) can't slip past the guard. Each Ask gets an ID; only the current one may
+        // change state, so a cancelled or superseded task can never clobber a newer Ask.
+        askPhase = wantsScreen ? .capturingScreen : .waiting(settings.provider)
+        let id = UUID()
+        currentAskID = id
+
         askTask = Task { [weak self] in
             do {
                 var screenshot: Data?
                 if wantsScreen {
-                    self?.askPhase = .capturingScreen
                     // Keep "Capturing Screen…" up long enough to be noticed.
                     async let minimumVisible: Void = try Task.sleep(for: .milliseconds(600))
                     screenshot = try await screenshotter.captureMainDisplayJPEG(maxLongEdge: 1568, quality: 0.7)
                     try await minimumVisible
                 }
                 try Task.checkCancellation()
-                self?.askPhase = .waiting(settings.provider)
+                self?.updateAsk(id, .waiting(settings.provider))
                 let request = ReplyRequest(transcript: recent,
                                            question: trimmedQuestion.isEmpty ? nil : trimmedQuestion,
                                            screenshotJPEG: screenshot,
                                            systemPrompt: settings.systemPrompt)
                 let reply = try await replyService.reply(to: request, settings: settings)
                 try Task.checkCancellation()
-                self?.finishAsk(.replied(reply))
+                self?.finishAsk(id, .replied(reply))
             } catch is CancellationError {
-                self?.askPhase = .idle
+                // cancelAsk() already reset the state for this Ask.
             } catch let error as AssistantError {
-                self?.finishAsk(.failed(AskFailure(error)))
+                self?.finishAsk(id, .failed(AskFailure(error)))
             } catch let error as ScreenshotError {
-                self?.finishAsk(.failed(AskFailure(error)))
+                self?.finishAsk(id, .failed(AskFailure(error)))
             } catch {
-                self?.finishAsk(.failed(AskFailure(.network(error.localizedDescription))))
+                self?.finishAsk(id, .failed(AskFailure(.network(error.localizedDescription))))
             }
         }
     }
@@ -279,6 +286,7 @@ final class IslandViewModel {
     func cancelAsk() {
         askTask?.cancel()
         askTask = nil
+        currentAskID = nil
         askPhase = .idle
     }
 
@@ -306,7 +314,14 @@ final class IslandViewModel {
         panelHost?.focusForKeyboard()
     }
 
-    private func finishAsk(_ phase: AskPhase) {
+    private func updateAsk(_ id: UUID, _ phase: AskPhase) {
+        guard currentAskID == id, !Task.isCancelled else { return }
+        askPhase = phase
+    }
+
+    private func finishAsk(_ id: UUID, _ phase: AskPhase) {
+        guard currentAskID == id, !Task.isCancelled else { return }
+        currentAskID = nil
         askTask = nil
         askPhase = phase
         // VoiceOver hears the outcome even while the island is collapsed.

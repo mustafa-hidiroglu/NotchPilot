@@ -38,6 +38,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        store.persistNow()
         // Leave nothing half-typed in memory: the view (and its key drafts) is rebuilt next time.
         window?.contentViewController = nil
         window = nil

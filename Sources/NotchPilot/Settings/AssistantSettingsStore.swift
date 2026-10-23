@@ -27,6 +27,7 @@ final class AssistantSettingsStore {
 
     @ObservationIgnored var onChange: ((_ old: AssistantSettings, _ new: AssistantSettings) -> Void)?
     @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private var persistTask: Task<Void, Never>?
     @ObservationIgnored private let keyStore: any APIKeyStoring
 
     init(defaults: UserDefaults = .standard, keyStore: any APIKeyStoring) {
@@ -97,7 +98,21 @@ final class AssistantSettingsStore {
 
     // MARK: Persistence
 
+    /// Debounced: typing in the system-prompt editor would otherwise encode and write
+    /// UserDefaults on every keystroke.
     private func persist() {
+        persistTask?.cancel()
+        persistTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard let self, !Task.isCancelled else { return }
+            self.persistNow()
+        }
+    }
+
+    /// Writes immediately (also used when Settings closes and on quit).
+    func persistNow() {
+        persistTask?.cancel()
+        persistTask = nil
         guard let data = try? JSONEncoder().encode(settings) else { return }
         defaults.set(data, forKey: Self.defaultsKey)
     }

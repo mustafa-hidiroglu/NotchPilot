@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Strong reference: the capture service holds its processor weakly.
     private var transcriber: SystemAudioTranscriber?
     private var settingsWindow: SettingsWindowController?
+    private var settingsStore: AssistantSettingsStore?
     private var model: IslandViewModel?
     private var panelController: IslandPanelController?
     private var statusItem: StatusItemController?
@@ -25,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                     screenshotter: ScreenshotCapturer(), settingsStore: settingsStore)
         let panelController = IslandPanelController(model: model, config: config)
         let settingsWindow = SettingsWindowController(store: settingsStore)
+        self.settingsStore = settingsStore
         model.openSettings = { [weak settingsWindow] in settingsWindow?.show() }
         // The island's Include Screen follows the default when the default changes.
         settingsStore.onChange = { [weak model] old, new in
@@ -124,6 +126,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        settingsStore?.persistNow()   // flush a pending debounced write
         observers.forEach { $0.cancel() }
         panelController?.invalidate()
     }

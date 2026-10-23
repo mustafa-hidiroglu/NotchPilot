@@ -131,7 +131,7 @@ struct AIClientTests {
         #expect(sent.value(forHTTPHeaderField: "anthropic-version") == "2023-06-01")
         #expect(sent.value(forHTTPHeaderField: "anthropic-beta") == "server-side-fallback-2026-07-01")
         #expect(sent.value(forHTTPHeaderField: "content-type") == "application/json")
-        #expect(sent.timeoutInterval == 120)
+        #expect(sent.timeoutInterval == ProviderHTTP.timeout)
 
         let body = try capturedJSON()
         #expect(body["model"] as? String == "claude-opus-5-5")
@@ -260,7 +260,7 @@ struct AIClientTests {
 
         let body = try capturedJSON()
         #expect(body["model"] as? String == "gpt-5-mini")
-        #expect(body["max_completion_tokens"] as? Int == 4_096)
+        #expect(body["max_completion_tokens"] as? Int == OpenAIClient.maxCompletionTokens)
         let messages = try #require(body["messages"] as? [[String: Any]])
         #expect(messages.map { $0["role"] as? String } == ["system", "user"])
         #expect(messages[0]["content"] as? String == "SYS")
@@ -278,6 +278,17 @@ struct AIClientTests {
             "model": "gpt-5", "choices": [["message": ["content": NSNull(), "refusal": "No."], "finish_reason": "stop"]],
         ])))
         await #expect(throws: AssistantError.refused(.openAI)) {
+            try await OpenAIClient(session: stubSession())
+                .reply(to: ReplyRequest(transcript: "t", systemPrompt: "s"), apiKey: "k", settings: AssistantSettings())
+        }
+    }
+
+    @Test("OpenAI empty content (budget spent on reasoning) is not returned as a blank reply")
+    func openAIEmptyContent() async throws {
+        StubURLProtocol.respond(.init(status: 200, body: json([
+            "model": "gpt-5", "choices": [["message": ["content": "", "refusal": NSNull()], "finish_reason": "length"]],
+        ])))
+        await #expect(throws: AssistantError.invalidResponse(.openAI)) {
             try await OpenAIClient(session: stubSession())
                 .reply(to: ReplyRequest(transcript: "t", systemPrompt: "s"), apiKey: "k", settings: AssistantSettings())
         }

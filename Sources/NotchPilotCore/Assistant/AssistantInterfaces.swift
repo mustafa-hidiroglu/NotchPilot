@@ -48,6 +48,27 @@ public struct AssistantSettings: Codable, Sendable, Equatable {
     public var transcriptCharacterLimit = 6_000
 
     public init() {}
+
+    // Tolerant decoding: settings saved by an older or newer build (missing keys, unknown
+    // provider) keep every value that is still readable instead of resetting everything.
+    private enum CodingKeys: String, CodingKey {
+        case provider, claudeModel, claudeEffort, openAIModel, systemPrompt
+        case includeScreenshotByDefault, transcriptCharacterLimit
+    }
+
+    public init(from decoder: Decoder) throws {
+        self.init()
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let raw = try? c.decodeIfPresent(String.self, forKey: .provider), let value = AIProvider(rawValue: raw) {
+            provider = value
+        }
+        claudeModel = (try? c.decodeIfPresent(String.self, forKey: .claudeModel)) ?? claudeModel
+        claudeEffort = (try? c.decodeIfPresent(String.self, forKey: .claudeEffort)) ?? claudeEffort
+        openAIModel = (try? c.decodeIfPresent(String.self, forKey: .openAIModel)) ?? openAIModel
+        systemPrompt = (try? c.decodeIfPresent(String.self, forKey: .systemPrompt)) ?? systemPrompt
+        includeScreenshotByDefault = (try? c.decodeIfPresent(Bool.self, forKey: .includeScreenshotByDefault)) ?? includeScreenshotByDefault
+        transcriptCharacterLimit = (try? c.decodeIfPresent(Int.self, forKey: .transcriptCharacterLimit)) ?? transcriptCharacterLimit
+    }
 }
 
 // MARK: - Replies
@@ -194,9 +215,12 @@ public struct Transcript: Sendable, Equatable {
     /// The last `limit` characters of the full text, cut at a word boundary when possible.
     public func recentText(limit: Int) -> String {
         let text = fullText
+        guard limit > 0 else { return "" }   // the limit is persisted in UserDefaults; never trap on bad values
         guard text.count > limit else { return text }
         let tail = text.suffix(limit)
-        if let space = tail.firstIndex(of: " ") { return String(tail[tail.index(after: space)...]) }
+        // Drop the leading fragment only when the cut landed inside a word.
+        let cutsWord = !text[text.index(before: tail.startIndex)].isWhitespace
+        if cutsWord, let space = tail.firstIndex(of: " ") { return String(tail[tail.index(after: space)...]) }
         return String(tail)
     }
 }
