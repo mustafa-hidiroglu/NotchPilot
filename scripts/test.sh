@@ -38,6 +38,8 @@ record() { # name status
 }
 
 if (( ! CPP_ONLY )); then
+    # Package.swift links Vendor/whisper.xcframework; build it from pinned source if missing.
+    scripts/build-whisper.sh || die "building whisper.cpp failed"
     echo "==> swift test"
     if swift test; then record "swift test" PASS; else record "swift test" FAIL; fi
 fi

@@ -3,9 +3,11 @@ import Foundation
 /// HTTP plumbing shared by `ClaudeClient` and `OpenAIClient`. Never logs keys, transcripts
 /// or bodies.
 enum ProviderHTTP {
-    /// Replies are non-streaming, so no bytes arrive until generation finishes; this idle
-    /// timeout must cover a long reply at higher effort.
+    /// Idle timeout: the longest wait for the next bytes of a reply. Replies stream, but the
+    /// first text can still take a while at higher effort, so this stays generous.
     static let timeout: TimeInterval = 600
+    /// The most of a non-2xx body read for its error message.
+    static let maxErrorBodyBytes = 16_384
 
     /// Ephemeral, cache-free session: nothing about a request is written to disk.
     static let defaultSession: URLSession = {
@@ -36,39 +38,106 @@ enum ProviderHTTP {
         return request
     }
 
-    /// Sends `request` and returns the body of a 2xx response; every other outcome becomes an
-    /// `AssistantError` (or `CancellationError` when the task was cancelled).
-    static func send(_ request: URLRequest, session: URLSession, provider: AIProvider) async throws -> Data {
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.data(for: request)
-        } catch let error as URLError {
-            if error.code == .cancelled { throw CancellationError() }
-            throw AssistantError.network(error.localizedDescription)
+    /// Sends `request` and turns its `text/event-stream` body into reply events through
+    /// `decoder`. Enforces the `ReplyGenerating` contract: exactly one `.finished` or a thrown
+    /// `AssistantError`; a reply that finishes with no text and no truncation, or a body that
+    /// ends before finishing, is `.invalidResponse`. Ending the stream cancels the request.
+    static func replyStream(
+        _ request: URLRequest,
+        session: URLSession,
+        provider: AIProvider,
+        decoder: some ReplyStreamDecoding
+    ) -> AsyncThrowingStream<ReplyEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try await pump(request, session: session, provider: provider, decoder: decoder, into: continuation)
+                    continuation.finish()
+                } catch let error as URLError {
+                    continuation.finish(throwing: error.code == .cancelled
+                        ? CancellationError() : AssistantError.network(error.localizedDescription))
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    private static func pump(
+        _ request: URLRequest,
+        session: URLSession,
+        provider: AIProvider,
+        decoder: some ReplyStreamDecoding,
+        into continuation: AsyncThrowingStream<ReplyEvent, Error>.Continuation
+    ) async throws {
+        // `bytes(for:)` cancels the underlying data task when this task is cancelled.
+        let (bytes, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse else { throw AssistantError.invalidResponse(provider) }
-        if let error = error(for: http, body: data, provider: provider) { throw error }
-        return data
+        guard (200..<300).contains(http.statusCode) else {
+            var body = Data()
+            for try await byte in bytes {
+                body.append(byte)
+                if body.count >= maxErrorBodyBytes { break }
+            }
+            throw error(for: http, body: body, provider: provider) ?? AssistantError.invalidResponse(provider)
+        }
+
+        var decoder = decoder
+        var parser = ServerSentEventParser()
+        var hasText = false
+        // Yields the events for one SSE event; true once the reply has finished.
+        func deliver(_ event: ServerSentEvent) throws -> Bool {
+            for reply in try decoder.decode(event) {
+                switch reply {
+                case .started:
+                    continuation.yield(reply)
+                case .textDelta(let text):
+                    guard !text.isEmpty else { continue }
+                    hasText = true
+                    continuation.yield(reply)
+                case .finished(let truncated):
+                    guard hasText || truncated else { throw AssistantError.invalidResponse(provider) }
+                    continuation.yield(reply)
+                    return true
+                }
+            }
+            return false
+        }
+
+        do {
+            for try await byte in bytes {
+                if let event = try parser.feed(byte), try deliver(event) { return }
+            }
+            if let event = try parser.finish(), try deliver(event) { return }
+        } catch is ServerSentEventParser.TooLarge {
+            throw AssistantError.invalidResponse(provider)
+        }
+        try Task.checkCancellation()
+        throw AssistantError.invalidResponse(provider)
     }
 
     static func error(for response: HTTPURLResponse, body: Data, provider: AIProvider) -> AssistantError? {
-        let status = response.statusCode
+        let retryAfter = response.value(forHTTPHeaderField: "retry-after")
+            .flatMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+        // Both providers wrap errors as {"error": {"message": ...}}.
+        let message = (try? JSONDecoder().decode(ErrorEnvelope.self, from: body))?.error.message
+        return error(status: response.statusCode, retryAfter: retryAfter, message: message, provider: provider)
+    }
+
+    /// Maps an HTTP status, or the status equivalent of an error that arrived mid-stream.
+    static func error(status: Int, retryAfter: Double? = nil, message: String?, provider: AIProvider) -> AssistantError? {
         switch status {
         case 200..<300:
             return nil
         case 401, 403:
             return .invalidAPIKey(provider)
         case 429:
-            let retryAfter = response.value(forHTTPHeaderField: "retry-after")
-                .flatMap { Double($0.trimmingCharacters(in: .whitespaces)) }
             return .rateLimited(provider, retryAfterSeconds: retryAfter)
         case 408, 500, 502, 503, 504, 529:
             return .providerUnavailable(provider, status: status)
         default:
-            // Both providers wrap errors as {"error": {"message": ...}}.
-            let message = (try? JSONDecoder().decode(ErrorEnvelope.self, from: body))?.error.message
-                ?? HTTPURLResponse.localizedString(forStatusCode: status)
+            let message = message ?? HTTPURLResponse.localizedString(forStatusCode: status)
             // Shown only as a tooltip; capped so a verbose error body can't flood the UI.
             return .requestRejected(provider, status: status, message: String(message.prefix(200)))
         }
@@ -78,4 +147,10 @@ enum ProviderHTTP {
         struct Detail: Decodable { var message: String }
         var error: Detail
     }
+}
+
+/// Turns one provider's server-sent events into reply events.
+protocol ReplyStreamDecoding: Sendable {
+    /// The reply events carried by `event` (often none), or a thrown `AssistantError`.
+    mutating func decode(_ event: ServerSentEvent) throws -> [ReplyEvent]
 }

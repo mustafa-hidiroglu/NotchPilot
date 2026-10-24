@@ -121,8 +121,18 @@ struct IslandView: View {
     private var header: some View {
         Button(action: model.toggleExpanded) {
             HStack(spacing: 0) {
-                CaptureGlyph(state: model.captureState)
-                    .frame(width: model.config.layout.compactWingWidth)
+                HStack(spacing: 4) {
+                    CaptureGlyph(state: model.captureState)
+                    if model.hasReplyWhileCollapsed {
+                        // A reply finished while collapsed; cleared when it's dismissed.
+                        Image(systemName: "text.bubble.fill")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(IslandPalette.primary)
+                            .accessibilityLabel("Reply ready")
+                            .transition(.opacity)
+                    }
+                }
+                .frame(width: model.config.layout.compactWingWidth)
                 Spacer(minLength: 0)
                 if !geometry.attachedToNotch {
                     Text("NotchPilot")
@@ -155,7 +165,7 @@ struct IslandView: View {
         case .stopping: "stopping capture"
         case .failed(let error): error.title
         }
-        return "NotchPilot, \(status)"
+        return model.hasReplyWhileCollapsed ? "NotchPilot, \(status), reply ready" : "NotchPilot, \(status)"
     }
 
     // MARK: Hover expansion (optional, off by default)
@@ -276,6 +286,15 @@ private struct ExpandedContent: View {
             TranscriptRow(model: model)
 
             AskRow(model: model, questionFocused: $questionFocused)
+                // Global Ask shortcut: the panel is already key; move focus into the field.
+                .onChange(of: model.wantsQuestionFocus, initial: true) { _, wants in
+                    guard wants else { return }
+                    questionFocused = true
+                    model.wantsQuestionFocus = false
+                    // Again after this layout pass, in case the field appeared in this same
+                    // update and wasn't in the window yet.
+                    Task { questionFocused = true }
+                }
 
             if model.askPhase != .idle {
                 AskOutput(model: model, height: outputHeight)
@@ -309,7 +328,7 @@ private struct ExpandedContent: View {
     /// stack spacing above it).
     private var outputHeight: CGFloat {
         let layout = model.config.layout
-        let accessory = if case .replied = model.askPhase { layout.expandedReplyHeight } else { layout.expandedNoticeHeight }
+        let accessory = model.askPhase.showsReply ? layout.expandedReplyHeight : layout.expandedNoticeHeight
         return accessory - 10
     }
 
@@ -363,7 +382,7 @@ private struct ExpandedContent: View {
         // Return belongs to the field (it asks).
         .keyboardShortcut(questionFocused ? nil : .defaultAction)
         .focused($primaryFocused)
-        .onAppear { primaryFocused = true }
+        .onAppear { if !model.wantsQuestionFocus { primaryFocused = true } }
     }
 
     private var telemetry: String {

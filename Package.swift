@@ -25,6 +25,11 @@ let package = Package(
         .executable(name: "NotchPilot", targets: ["NotchPilot"]),
     ],
     targets: [
+        // whisper.cpp (on-device speech-to-text), built from pinned upstream source by
+        // scripts/build-whisper.sh (tag v1.9.5, commit verified) as a static, universal
+        // library. Static linking keeps the app free of third-party dylibs, so library
+        // validation stays on. scripts/build.sh and scripts/test.sh create it when missing.
+        .binaryTarget(name: "whisper", path: "Vendor/whisper.xcframework"),
         // C++20 real-time primitives. Public surface: include/NPRingBuffer.h only.
         .target(
             name: "NPRingBuffer",
@@ -37,10 +42,11 @@ let package = Package(
             ]
         ),
         // Platform logic without AppKit UI: configuration, geometry, PCM conversion,
-        // ring-buffer wrapper, ScreenCaptureKit capture and the non-real-time consumer.
+        // ring-buffer wrapper, ScreenCaptureKit capture, the non-real-time consumer and
+        // whisper.cpp transcription.
         .target(
             name: "NotchPilotCore",
-            dependencies: ["NPRingBuffer"],
+            dependencies: ["NPRingBuffer", "whisper"],
             path: "Sources/NotchPilotCore",
             swiftSettings: swiftCommon
         ),

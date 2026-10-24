@@ -8,16 +8,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let config = NotchPilotConfig.default
     private var service: AudioCaptureService?
     /// Strong reference: the capture service holds its processor weakly.
-    private var transcriber: SystemAudioTranscriber?
+    private var transcriber: WhisperTranscriber?
+    /// Whisper model downloads; Settings › Speech shows and drives it.
+    private(set) var speechModels: SpeechModelStore?
     private var settingsWindow: SettingsWindowController?
     private var settingsStore: AssistantSettingsStore?
     private var model: IslandViewModel?
     private var panelController: IslandPanelController?
     private var statusItem: StatusItemController?
+    private var hotKeys: HotKeyCenter?
+    private var speechModelsController: SpeechModelsController?
     private var observers: [Task<Void, Never>] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let transcriber = SystemAudioTranscriber(locale: .current)
+        let speechModels = SpeechModelStore()
+        let transcriber = WhisperTranscriber(modelStore: speechModels)
         let service = AudioCaptureService(config: config, processor: transcriber)
         let keyStore = KeychainAPIKeyStore()
         let settingsStore = AssistantSettingsStore(keyStore: keyStore)
@@ -25,13 +30,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                     replyService: ReplyService(keyStore: keyStore),
                                     screenshotter: ScreenshotCapturer(), settingsStore: settingsStore)
         let panelController = IslandPanelController(model: model, config: config)
-        let settingsWindow = SettingsWindowController(store: settingsStore)
+        let hotKeys = HotKeyCenter()
+        let speechModelsController = SpeechModelsController(store: speechModels)
+        model.speechModels = speechModelsController
+        // Deleting the in-use model stops transcription with it: restarting finds no file,
+        // reports .needsModel and frees the loaded model.
+        speechModelsController.onModelUninstalled = { [weak model, weak settingsStore] id in
+            if id == settingsStore?.settings.speechModelID { model?.speechSettingsDidChange() }
+        }
+        let settingsWindow = SettingsWindowController(store: settingsStore, speechModels: speechModelsController, hotKeys: hotKeys)
         self.settingsStore = settingsStore
-        model.openSettings = { [weak settingsWindow] in settingsWindow?.show() }
-        // The island's Include Screen follows the default when the default changes.
-        settingsStore.onChange = { [weak model] old, new in
+        model.openSettings = { [weak settingsWindow] pane in settingsWindow?.show(pane: pane) }
+
+        // Global Ask shortcut: open the island ready to type; press again to close.
+        hotKeys.onPress = { [weak panelController] in panelController?.toggleQuickAsk() }
+        hotKeys.update(enabled: settingsStore.settings.askHotKeyEnabled, hotKey: settingsStore.settings.askHotKey)
+
+        settingsStore.onChange = { [weak model, weak hotKeys] old, new in
+            // The island's Include Screen follows the default when the default changes.
             if old.includeScreenshotByDefault != new.includeScreenshotByDefault {
                 model?.includeScreen = new.includeScreenshotByDefault
+            }
+            if old.speechModelID != new.speechModelID || old.speechLanguage != new.speechLanguage {
+                model?.speechSettingsDidChange()
+            }
+            if old.askHotKeyEnabled != new.askHotKeyEnabled || old.askHotKey != new.askHotKey {
+                hotKeys?.update(enabled: new.askHotKeyEnabled, hotKey: new.askHotKey)
             }
         }
 
@@ -49,14 +73,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             openPrivacySettings: { [weak model] in model?.openPrivacySettings() },
             openSettings: { [weak settingsWindow] in settingsWindow?.show() },
             clearTranscript: { [weak model] in model?.clearTranscript() },
-            ask: { [weak panelController, weak model] in
-                // Shows the island so the progress and reply are visible.
-                panelController?.show()
-                model?.setPresentation(.expanded)
-                model?.ask()
-            },
+            ask: { [weak panelController] in panelController?.beginQuickAsk() },
             askTitle: { [weak model] in "Ask \(model?.provider.displayName ?? "")" },
-            isAsking: { [weak model] in model?.askPhase.isBusy ?? false },
+            askShortcut: { [weak settingsStore, weak hotKeys] in
+                guard let settings = settingsStore?.settings, settings.askHotKeyEnabled,
+                      let hotKeys, hotKeys.isActive else { return nil }
+                return settings.askHotKey
+            },
             hasTranscript: { [weak model] in !(model?.transcript.fullText.isEmpty ?? true) },
             isIslandVisible: { [weak panelController] in panelController?.isVisible ?? false },
             captureState: { [weak model] in model?.captureState ?? .idle }))
@@ -79,6 +102,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 model?.transcript = transcript
             }
         })
+        // A finished download of the selected model lets a running capture start transcribing.
+        observers.append(Task { [weak model, weak settingsStore] in
+            var wasInstalled: Bool?
+            for await snapshot in speechModels.installStates {
+                guard let selected = settingsStore?.settings.speechModelID else { continue }
+                let installed = snapshot[selected] == .installed
+                if installed, wasInstalled == false { model?.speechSettingsDidChange() }
+                wasInstalled = installed
+            }
+        })
         observers.append(Task { [weak model] in
             for await snapshot in service.levels {
                 model?.level = snapshot
@@ -87,10 +120,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         self.service = service
         self.transcriber = transcriber
+        self.speechModels = speechModels
         self.settingsWindow = settingsWindow
         self.model = model
         self.panelController = panelController
         self.statusItem = statusItem
+        self.hotKeys = hotKeys
+        self.speechModelsController = speechModelsController
         MainMenu.install(settingsTarget: self, settingsAction: #selector(showSettings))
         panelController.show()   // capture stays off until the person starts it
     }
@@ -128,6 +164,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         settingsStore?.persistNow()   // flush a pending debounced write
         observers.forEach { $0.cancel() }
+        transcriber?.shutdown()   // the whisper model must be freed before exit (see shutdown())
+        hotKeys?.invalidate()
+        speechModelsController?.invalidate()
         panelController?.invalidate()
     }
 }

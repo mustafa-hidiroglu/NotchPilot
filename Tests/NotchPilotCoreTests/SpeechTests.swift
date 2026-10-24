@@ -1,5 +1,4 @@
 import Foundation
-import Speech
 import Testing
 @testable import NotchPilotCore
 
@@ -96,65 +95,5 @@ struct TranscriptTests {
         #expect(transcript.recentText(limit: 100) == "one two three four")
         #expect(transcript.recentText(limit: 9) == "four")
         #expect(transcript.recentText(limit: 11) == "three four")
-    }
-}
-
-@Suite("SystemAudioTranscriber state")
-struct SystemAudioTranscriberStateTests {
-
-    private func transcriber(
-        status: SFSpeechRecognizerAuthorizationStatus,
-        unavailableReason: String = "Not on this Mac."
-    ) -> SystemAudioTranscriber {
-        SystemAudioTranscriber(locale: Locale(identifier: "en_US"),
-                                         authorizationStatus: { status },
-                                         makeRecognizer: { _ in .failure(.init(reason: unavailableReason)) })
-    }
-
-    private func firstStateAfterOff(_ transcriber: SystemAudioTranscriber) async -> TranscriptionState? {
-        for await state in transcriber.states where state != .off { return state }
-        return nil
-    }
-
-    @Test("starts off")
-    func startsOff() async {
-        let speech = transcriber(status: .authorized)
-        var states = speech.states.makeAsyncIterator()
-        #expect(await states.next() == .off)
-    }
-
-    @Test("reports unavailable when on-device recognition is unsupported")
-    func unavailable() async {
-        let speech = transcriber(status: .authorized, unavailableReason: "No on-device model.")
-        speech.start()
-        #expect(await firstStateAfterOff(speech) == .unavailable("No on-device model."))
-    }
-
-    @Test("reports needsPermission before the person has been asked")
-    func needsPermission() async {
-        let speech = transcriber(status: .notDetermined)
-        speech.start()
-        #expect(await firstStateAfterOff(speech) == .needsPermission)
-    }
-
-    @Test("reports permissionDenied when denied or restricted", arguments: [
-        SFSpeechRecognizerAuthorizationStatus.denied, .restricted,
-    ])
-    func denied(status: SFSpeechRecognizerAuthorizationStatus) async {
-        let speech = transcriber(status: status)
-        speech.start()
-        #expect(await firstStateAfterOff(speech) == .permissionDenied)
-    }
-
-    @Test("ignores audio while not listening")
-    func ignoresAudioWhenOff() async {
-        let speech = transcriber(status: .authorized)
-        let samples: [Float] = [0.1, 0.2, 0.3, 0.4]
-        samples.withUnsafeBufferPointer {
-            speech.process($0, frames: 2, format: PCMFormat(sampleRate: 48_000, channelCount: 2))
-        }
-        speech.clear()
-        var transcripts = speech.transcripts.makeAsyncIterator()
-        #expect(await transcripts.next() == Transcript())
     }
 }

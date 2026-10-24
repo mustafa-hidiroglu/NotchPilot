@@ -12,25 +12,22 @@ public struct ClaudeClient: ReplyGenerating {
         self.session = session ?? ProviderHTTP.defaultSession
     }
 
-    public func reply(to request: ReplyRequest, apiKey: String, settings: AssistantSettings) async throws -> AssistantReply {
-        let urlRequest = try ProviderHTTP.jsonRequest(
-            url: Self.endpoint,
-            headers: [
-                "x-api-key": apiKey,
-                "anthropic-version": "2023-06-01",
-                "anthropic-beta": "server-side-fallback-2026-07-01",
-            ],
-            body: Self.body(for: request, settings: settings)
-        )
-        let data = try await ProviderHTTP.send(urlRequest, session: session, provider: provider)
-        guard let response = try? JSONDecoder().decode(MessageResponse.self, from: data) else {
-            throw AssistantError.invalidResponse(provider)
+    public func streamReply(to request: ReplyRequest, apiKey: String, settings: AssistantSettings) -> AsyncThrowingStream<ReplyEvent, Error> {
+        let urlRequest: URLRequest
+        do {
+            urlRequest = try ProviderHTTP.jsonRequest(
+                url: Self.endpoint,
+                headers: [
+                    "x-api-key": apiKey,
+                    "anthropic-version": "2023-06-01",
+                    "anthropic-beta": "server-side-fallback-2026-07-01",
+                ],
+                body: Self.body(for: request, settings: settings)
+            )
+        } catch {
+            return AsyncThrowingStream { $0.finish(throwing: AssistantError.invalidResponse(provider)) }
         }
-        if response.stopReason == "refusal" { throw AssistantError.refused(provider) }
-        let text = response.content.filter { $0.type == "text" }.compactMap(\.text).joined()
-        let truncated = response.stopReason == "max_tokens"
-        guard !text.isEmpty || truncated else { throw AssistantError.invalidResponse(provider) }
-        return AssistantReply(text: text, provider: provider, model: response.model, truncated: truncated)
+        return ProviderHTTP.replyStream(urlRequest, session: session, provider: provider, decoder: StreamDecoder())
     }
 
     static func body(for request: ReplyRequest, settings: AssistantSettings) -> MessageRequest {
@@ -65,9 +62,10 @@ public struct ClaudeClient: ReplyGenerating {
         var messages: [Message]
         var outputConfig: OutputConfig
         var fallbacks: String
+        var stream = true
 
         enum CodingKeys: String, CodingKey {
-            case model, system, messages, fallbacks
+            case model, system, messages, fallbacks, stream
             case maxTokens = "max_tokens"
             case outputConfig = "output_config"
         }
@@ -101,18 +99,88 @@ public struct ClaudeClient: ReplyGenerating {
         }
     }
 
-    struct MessageResponse: Decodable {
-        struct Block: Decodable {
-            var type: String
-            var text: String?
+    /// Messages streaming events. Only text blocks reach the reply: `thinking` blocks and the
+    /// `fallback` audit marker (written when a server-side fallback switches models
+    /// mid-response) are skipped. A fallback before any output just means `message_start`
+    /// names the fallback model.
+    struct StreamDecoder: ReplyStreamDecoding {
+        private var textBlocks: Set<Int> = []
+        private var stopReason: String?
+
+        mutating func decode(_ event: ServerSentEvent) throws -> [ReplyEvent] {
+            guard let payload = try? JSONDecoder().decode(StreamEvent.self, from: Data(event.data.utf8)) else {
+                throw AssistantError.invalidResponse(.claude)
+            }
+            switch payload.type {
+            case "message_start":
+                guard let model = payload.message?.model else { throw AssistantError.invalidResponse(.claude) }
+                return [.started(model: model)]
+            case "content_block_start":
+                if payload.contentBlock?.type == "text", let index = payload.index { textBlocks.insert(index) }
+            case "content_block_delta":
+                if let index = payload.index, textBlocks.contains(index),
+                   payload.delta?.type == "text_delta", let text = payload.delta?.text {
+                    return [.textDelta(text)]
+                }
+            case "message_delta":
+                if let reason = payload.delta?.stopReason {
+                    if reason == "refusal" { throw AssistantError.refused(.claude) }
+                    stopReason = reason
+                }
+            case "message_stop":
+                return [.finished(truncated: stopReason == "max_tokens")]
+            case "error":
+                throw Self.error(type: payload.error?.type, message: payload.error?.message)
+            default:
+                break // ping, content_block_stop, and event types added later
+            }
+            return []
         }
-        var model: String
-        var content: [Block]
-        var stopReason: String?
+
+        /// Maps an `error` event through the HTTP status the same error type has.
+        static func error(type: String?, message: String?) -> AssistantError {
+            let status = switch type {
+            case "invalid_request_error": 400
+            case "authentication_error": 401
+            case "permission_error": 403
+            case "not_found_error": 404
+            case "request_too_large": 413
+            case "rate_limit_error": 429
+            case "timeout_error": 504
+            case "overloaded_error": 529
+            default: 500 // api_error and unknown types
+            }
+            return ProviderHTTP.error(status: status, message: message, provider: .claude)
+                ?? .providerUnavailable(.claude, status: status)
+        }
+    }
+
+    struct StreamEvent: Decodable {
+        struct Message: Decodable { var model: String }
+        struct Block: Decodable { var type: String }
+        struct Delta: Decodable {
+            var type: String?
+            var text: String?
+            var stopReason: String?
+            enum CodingKeys: String, CodingKey {
+                case type, text
+                case stopReason = "stop_reason"
+            }
+        }
+        struct ErrorDetail: Decodable {
+            var type: String?
+            var message: String?
+        }
+        var type: String
+        var index: Int?
+        var message: Message?
+        var contentBlock: Block?
+        var delta: Delta?
+        var error: ErrorDetail?
 
         enum CodingKeys: String, CodingKey {
-            case model, content
-            case stopReason = "stop_reason"
+            case type, index, message, delta, error
+            case contentBlock = "content_block"
         }
     }
 }

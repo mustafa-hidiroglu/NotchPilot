@@ -1,6 +1,6 @@
 import Foundation
 
-/// Pure helpers behind `SystemAudioTranscriber`: downmixing captured blocks and keeping the
+/// Pure helpers behind `WhisperTranscriber`: downmixing captured blocks and keeping the
 /// rolling transcript bounded. No framework state, so they are unit-tested directly.
 enum SpeechText {
     /// Default cap for `Transcript.finalText`.

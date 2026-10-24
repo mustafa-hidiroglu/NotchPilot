@@ -17,6 +17,12 @@ public struct ReplyService: Sendable {
     }
 
     public func reply(to request: ReplyRequest, settings: AssistantSettings) async throws -> AssistantReply {
+        try await AssistantReply.collect(streamReply(to: request, settings: settings), provider: settings.provider)
+    }
+
+    /// Validates the Ask synchronously (throws `.nothingToSend` or `.missingAPIKey` before any
+    /// network use), then streams the reply from the selected provider.
+    public func streamReply(to request: ReplyRequest, settings: AssistantSettings) throws -> AsyncThrowingStream<ReplyEvent, Error> {
         let hasTranscript = !request.transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let hasQuestion = !(request.question?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
         guard hasTranscript || hasQuestion else { throw AssistantError.nothingToSend }
@@ -29,6 +35,6 @@ public struct ReplyService: Sendable {
         case .claude: claude
         case .openAI: openAI
         }
-        return try await client.reply(to: request, apiKey: apiKey, settings: settings)
+        return client.streamReply(to: request, apiKey: apiKey, settings: settings)
     }
 }

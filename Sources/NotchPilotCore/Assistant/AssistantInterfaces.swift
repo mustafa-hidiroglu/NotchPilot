@@ -5,7 +5,8 @@ import Foundation
 // depends on these types.
 //
 // Privacy model (README › Permissions and privacy):
-//  * Transcription is on-device only. Audio never leaves the Mac.
+//  * Transcription is on-device only (whisper.cpp). Audio never leaves the Mac. The only
+//    speech-related network use is downloading a model file once, when the person asks.
 //  * Nothing is sent over the network until the person presses Ask. Then exactly one
 //    request goes to the provider they chose, containing the transcript text and, only if
 //    they ticked it, one screenshot.
@@ -46,6 +47,14 @@ public struct AssistantSettings: Codable, Sendable, Equatable {
     public var includeScreenshotByDefault = false
     /// How much recent transcript to send with a request.
     public var transcriptCharacterLimit = 6_000
+    /// `SpeechModel.id` of the whisper model to transcribe with. Defaults to one sized for
+    /// this Mac's chip (see `SpeechModel.recommendedID`).
+    public var speechModelID = SpeechModel.recommendedID
+    /// Whisper language code ("en", "de", …) or "auto" to detect it.
+    public var speechLanguage = "auto"
+    /// Global keyboard shortcut that opens the island ready to Ask.
+    public var askHotKeyEnabled = true
+    public var askHotKey = HotKey.defaultAsk
 
     public init() {}
 
@@ -54,6 +63,7 @@ public struct AssistantSettings: Codable, Sendable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case provider, claudeModel, claudeEffort, openAIModel, systemPrompt
         case includeScreenshotByDefault, transcriptCharacterLimit
+        case speechModelID, speechLanguage, askHotKeyEnabled, askHotKey
     }
 
     public init(from decoder: Decoder) throws {
@@ -68,7 +78,29 @@ public struct AssistantSettings: Codable, Sendable, Equatable {
         systemPrompt = (try? c.decodeIfPresent(String.self, forKey: .systemPrompt)) ?? systemPrompt
         includeScreenshotByDefault = (try? c.decodeIfPresent(Bool.self, forKey: .includeScreenshotByDefault)) ?? includeScreenshotByDefault
         transcriptCharacterLimit = (try? c.decodeIfPresent(Int.self, forKey: .transcriptCharacterLimit)) ?? transcriptCharacterLimit
+        if let id = try? c.decodeIfPresent(String.self, forKey: .speechModelID), SpeechModel.catalog.contains(where: { $0.id == id }) {
+            speechModelID = id
+        }
+        speechLanguage = (try? c.decodeIfPresent(String.self, forKey: .speechLanguage)) ?? speechLanguage
+        askHotKeyEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .askHotKeyEnabled)) ?? askHotKeyEnabled
+        askHotKey = (try? c.decodeIfPresent(HotKey.self, forKey: .askHotKey)) ?? askHotKey
     }
+}
+
+/// A global keyboard shortcut: a virtual key code plus Carbon modifier flags
+/// (`cmdKey`, `optionKey`, `controlKey`, `shiftKey`), as `RegisterEventHotKey` takes them.
+public struct HotKey: Codable, Sendable, Equatable {
+    public var keyCode: UInt32
+    public var carbonModifiers: UInt32
+
+    public init(keyCode: UInt32, carbonModifiers: UInt32) {
+        self.keyCode = keyCode
+        self.carbonModifiers = carbonModifiers
+    }
+
+    /// ⇧⌘Space. Not bound by macOS by default; ⌃⌥Space switches input sources, ⌘Space is
+    /// Spotlight, and ⌥Space is taken by the ChatGPT and Raycast apps.
+    public static let defaultAsk = HotKey(keyCode: 49 /* kVK_Space */, carbonModifiers: 0x0100 /* cmdKey */ | 0x0200 /* shiftKey */)
 }
 
 // MARK: - Replies
@@ -171,10 +203,50 @@ public enum AssistantError: Error, Sendable, Equatable {
     }
 }
 
+/// One step of a streamed reply.
+public enum ReplyEvent: Sendable, Equatable {
+    /// The provider accepted the request; `model` is the model actually serving it.
+    case started(model: String)
+    /// More reply text, to append to what came before.
+    case textDelta(String)
+    /// The reply is complete. `truncated` is true when the output limit cut it off.
+    case finished(truncated: Bool)
+}
+
 /// One provider's HTTP client. Implementations: `ClaudeClient`, `OpenAIClient`.
+///
+/// The stream yields `.started`, any number of `.textDelta`, then exactly one `.finished`,
+/// or ends by throwing an `AssistantError` (a refusal mid-stream throws `.refused`; the
+/// caller discards the partial text). Cancelling the consuming task cancels the request.
 public protocol ReplyGenerating: Sendable {
     var provider: AIProvider { get }
-    func reply(to request: ReplyRequest, apiKey: String, settings: AssistantSettings) async throws -> AssistantReply
+    func streamReply(to request: ReplyRequest, apiKey: String, settings: AssistantSettings) -> AsyncThrowingStream<ReplyEvent, Error>
+}
+
+extension ReplyGenerating {
+    /// Collects a streamed reply into one value.
+    public func reply(to request: ReplyRequest, apiKey: String, settings: AssistantSettings) async throws -> AssistantReply {
+        try await AssistantReply.collect(streamReply(to: request, apiKey: apiKey, settings: settings), provider: provider)
+    }
+}
+
+extension AssistantReply {
+    /// Folds a reply stream into one value. Throws `.invalidResponse` for a stream that ends
+    /// without `.finished`, or finishes with no text and no truncation.
+    public static func collect(_ events: AsyncThrowingStream<ReplyEvent, Error>, provider: AIProvider) async throws -> AssistantReply {
+        var model = ""
+        var text = ""
+        for try await event in events {
+            switch event {
+            case .started(let name): model = name
+            case .textDelta(let delta): text += delta
+            case .finished(let truncated):
+                guard !text.isEmpty || truncated else { throw AssistantError.invalidResponse(provider) }
+                return AssistantReply(text: text, provider: provider, model: model, truncated: truncated)
+            }
+        }
+        throw AssistantError.invalidResponse(provider)
+    }
 }
 
 /// Secret storage for provider API keys. Implementation: `KeychainAPIKeyStore`.
@@ -188,13 +260,101 @@ public protocol APIKeyStoring: Sendable {
 
 public enum TranscriptionState: Sendable, Equatable {
     case off
-    case needsPermission
-    case permissionDenied
-    /// On-device recognition is not available for this language/Mac; never falls back
-    /// to server-based recognition.
+    /// The selected whisper model is not downloaded yet (Settings › Speech offers it).
+    case needsModel
+    /// The model file is being loaded into memory (a second or two on first start).
+    case loadingModel
+    /// The model could not be used, e.g. a damaged file; the string is shown to the person.
     case unavailable(String)
     case listening
     case failed(String)
+}
+
+/// Turns captured system audio into a rolling transcript. Implementation: `WhisperTranscriber`.
+///
+/// Also a `PCMBlockProcessor`: plug it into `AudioCaptureService(processor:)` and keep a
+/// strong reference (the service holds its processor weakly).
+public protocol SystemAudioTranscribing: PCMBlockProcessor, Sendable {
+    /// Newest state wins; starts with `.off`.
+    var states: AsyncStream<TranscriptionState> { get }
+    /// Newest transcript wins; starts empty.
+    var transcripts: AsyncStream<Transcript> { get }
+    /// Starts listening with the model in `settings` (loading it if needed). Calling it
+    /// while listening with the same model and language does nothing; with different ones
+    /// it switches.
+    func start(model: SpeechModel, language: String)
+    /// Stops listening. The utterance in progress is kept as final text.
+    func stop()
+    /// Forgets the transcript.
+    func clear()
+}
+
+// MARK: - Speech models
+
+/// A whisper.cpp ggml model that can be downloaded from Hugging Face.
+public struct SpeechModel: Sendable, Equatable, Identifiable {
+    public let id: String
+    public let displayName: String
+    /// One line for Settings, e.g. "Fastest. Good for Intel Macs."
+    public let summary: String
+    public let fileName: String
+    public let sizeBytes: Int64
+    /// Lower-case hex SHA-256 of the file; a download that doesn't match is discarded.
+    public let sha256: String
+
+    /// Pinned to one commit of the Hugging Face repository, so the file behind the URL
+    /// can't change (the SHA-256 check would reject it anyway). Redirects to the
+    /// Hugging Face CDN (*.hf.co).
+    public var downloadURL: URL {
+        URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/\(fileName)")!
+    }
+
+    /// Multilingual models only, so `speechLanguage` can be anything whisper supports.
+    public static let catalog: [SpeechModel] = [
+        SpeechModel(id: "tiny", displayName: "Tiny", summary: "Fastest, least accurate. Best for Intel Macs.",
+                    fileName: "ggml-tiny.bin", sizeBytes: 77_691_713,
+                    sha256: "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21"),
+        SpeechModel(id: "base", displayName: "Base", summary: "Fast and accurate enough for most speech.",
+                    fileName: "ggml-base.bin", sizeBytes: 147_951_465,
+                    sha256: "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe"),
+        SpeechModel(id: "small", displayName: "Small", summary: "More accurate; needs an Apple silicon Mac.",
+                    fileName: "ggml-small.bin", sizeBytes: 487_601_967,
+                    sha256: "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"),
+        SpeechModel(id: "large-v3-turbo", displayName: "Large Turbo", summary: "Most accurate; for M-series Macs with 16 GB.",
+                    fileName: "ggml-large-v3-turbo-q5_0.bin", sizeBytes: 574_041_195,
+                    sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"),
+    ]
+
+    /// "base" on Apple silicon (Metal keeps it real-time), "tiny" on Intel (CPU only).
+    public static var recommendedID: String {
+        #if arch(arm64)
+        "base"
+        #else
+        "tiny"
+        #endif
+    }
+
+    public static func named(_ id: String) -> SpeechModel? { catalog.first { $0.id == id } }
+}
+
+public enum SpeechModelInstallState: Sendable, Equatable {
+    case notInstalled
+    case downloading(fraction: Double)
+    case installed
+    case failed(String)
+}
+
+/// Downloads, verifies, stores and deletes speech models. Implementation: `SpeechModelStore`
+/// (files under ~/Library/Application Support/NotchPilot/Models).
+public protocol SpeechModelManaging: Sendable {
+    /// Install state of every catalog model; newest snapshot wins; starts with the current one.
+    var installStates: AsyncStream<[SpeechModel.ID: SpeechModelInstallState]> { get }
+    /// Path of the verified model file, or nil when it isn't installed.
+    func installedFileURL(for model: SpeechModel) -> URL?
+    /// Downloads and verifies the model. Progress is published on `installStates`.
+    /// Cancelling the calling task cancels the download.
+    func download(_ model: SpeechModel) async throws
+    func delete(_ model: SpeechModel) throws
 }
 
 /// A rolling, in-memory transcript. `finalText` holds completed utterances; `partialText`

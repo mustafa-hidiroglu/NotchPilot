@@ -98,6 +98,27 @@ final class IslandPanelController: IslandPanelHosting {
         panel.makeKey()
     }
 
+    // MARK: Quick Ask (global shortcut and the status menu's Ask item)
+
+    /// Opens the island expanded with the question field focused, or, if a quick Ask is
+    /// already open, closes it (which hands keyboard focus back to the previous app).
+    func toggleQuickAsk() {
+        if panel.isVisible, panel.isKeyWindow, model.presentation == .expanded {
+            model.setPresentation(.compact)
+        } else {
+            beginQuickAsk()
+        }
+    }
+
+    /// The panel stays non-activating: it becomes key so the field takes typing, while the
+    /// frontmost app stays active.
+    func beginQuickAsk() {
+        show()
+        model.setPresentation(.expanded)
+        panel.makeKey()
+        model.requestQuestionFocus()
+    }
+
     // MARK: Geometry
 
     private func refreshGeometry() {

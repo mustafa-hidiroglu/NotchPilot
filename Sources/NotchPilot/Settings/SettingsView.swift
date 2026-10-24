@@ -1,10 +1,9 @@
 import NotchPilotCore
 import SwiftUI
 
-/// The single-pane settings window (HIG › Settings: general, infrequently changed options;
-/// one pane, so the window is titled "NotchPilot Settings"). Standard grouped Form controls in
-/// the system appearance; nothing here is island-styled.
-struct SettingsView: View {
+/// Settings › Assistant: provider, API key, model and system prompt. Standard grouped Form
+/// controls in the system appearance; nothing in Settings is island-styled.
+struct AssistantSettingsPane: View {
     @Bindable var store: AssistantSettingsStore
     @State private var keyDrafts: [AIProvider: String] = [:]
     @State private var confirmingRemoval: AIProvider?
@@ -46,13 +45,6 @@ struct SettingsView: View {
             }
 
             Section {
-                Toggle(isOn: $store.settings.includeScreenshotByDefault) {
-                    Text("Include screen by default")
-                    Text("Ask attaches one screenshot of your main display. You can change this for each request in the island.")
-                }
-            }
-
-            Section {
                 TextEditor(text: $store.settings.systemPrompt)
                     .font(.body)
                     .frame(height: 96)
@@ -69,7 +61,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 500, height: 620)
+        .frame(width: SettingsPane.width, height: 560)
         .confirmationDialog(removalTitle, isPresented: removalBinding, presenting: confirmingRemoval) { provider in
             Button("Remove Key", role: .destructive) { store.removeKey(for: provider) }
             Button("Cancel", role: .cancel) {}
@@ -103,8 +95,7 @@ struct SettingsView: View {
             }
         }
         if let error = store.keyError {
-            Label(error.message, systemImage: "exclamationmark.triangle.fill")
-                .foregroundStyle(.red)
+            ErrorLabel(error.message)
                 .help(error.technicalDetail ?? "")
         }
     }
@@ -168,6 +159,28 @@ struct SettingsView: View {
             Text("API keys are stored in your Keychain. Transcripts, screenshots and replies stay in memory and are never saved to disk.")
         }
         .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// Inline error in Settings: only the symbol is red; the text keeps the primary label
+/// colour, because red text on the grouped background is below 4.5:1
+/// (HIG › Accessibility; HIG › Color: don't rely on colour alone).
+struct ErrorLabel: View {
+    let message: String
+    var textStyle: HierarchicalShapeStyle = .primary
+
+    init(_ message: String, textStyle: HierarchicalShapeStyle = .primary) {
+        self.message = message
+        self.textStyle = textStyle
+    }
+
+    var body: some View {
+        Label {
+            Text(message).foregroundStyle(textStyle)
+        } icon: {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+        }
         .fixedSize(horizontal: false, vertical: true)
     }
 }

@@ -14,7 +14,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         var clearTranscript: () -> Void
         var ask: () -> Void
         var askTitle: () -> String
-        var isAsking: () -> Bool
+        /// The global Ask shortcut when it is on and registered, shown on the Ask item.
+        var askShortcut: () -> HotKey?
         var hasTranscript: () -> Bool
         var isIslandVisible: () -> Bool
         var captureState: () -> CaptureState
@@ -61,8 +62,19 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(item(state.isActive ? "Stop Capture" : "Start Capture", key: "r", action: #selector(toggleCapture)))
         menu.addItem(item("Show Controls", key: "", action: #selector(showControls)))
         menu.addItem(item(actions.isIslandVisible() ? "Hide Island" : "Show Island", key: "", action: #selector(toggleIsland)))
-        let ask = item(actions.askTitle(), key: "", action: #selector(askAssistant))
-        ask.isEnabled = !actions.isAsking()
+        // Same action as the global shortcut: opens the island with the question field ready
+        // (ellipsis: more input follows, HIG › Menus). The shortcut is shown the standard
+        // way, right-aligned (HIG › Menus: "a menu item can also display the associated
+        // keyboard command"); keys a menu can't draw go in the tooltip instead.
+        let ask = item(actions.askTitle() + "…", key: "", action: #selector(askAssistant))
+        if let shortcut = actions.askShortcut() {
+            if let equivalent = shortcut.menuKeyEquivalent {
+                ask.keyEquivalent = equivalent.key
+                ask.keyEquivalentModifierMask = equivalent.modifiers
+            } else {
+                ask.toolTip = "Shortcut: \(shortcut.localizedDisplay)"
+            }
+        }
         menu.addItem(ask)
         let clear = item("Clear Transcript", key: "", action: #selector(clearTranscript))
         clear.isEnabled = actions.hasTranscript()

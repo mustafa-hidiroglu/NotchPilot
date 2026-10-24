@@ -19,14 +19,26 @@ protocol IslandPanelHosting: AnyObject {
 enum AskPhase: Equatable {
     case idle
     case capturingScreen
+    /// The request is sent; nothing has come back yet.
     case waiting(AIProvider)
-    case replied(AssistantReply)
+    /// Reply text is arriving; `reply.text` grows (coalesced) until the stream finishes.
+    case streaming(AssistantReply)
+    /// The complete reply, or the part that arrived before the person pressed Stop.
+    case replied(AssistantReply, stoppedEarly: Bool)
     case failed(AskFailure)
 
     var isBusy: Bool {
         switch self {
-        case .capturingScreen, .waiting: true
+        case .capturingScreen, .waiting, .streaming: true
         case .idle, .replied, .failed: false
+        }
+    }
+
+    /// Phases that show reply text and use the tall output area.
+    var showsReply: Bool {
+        switch self {
+        case .streaming, .replied: true
+        case .idle, .capturingScreen, .waiting, .failed: false
         }
     }
 }
@@ -112,19 +124,28 @@ final class IslandViewModel {
     /// while a change animates, so growing content is never clipped by the window.
     @ObservationIgnored private(set) var panelAccessoryHeight: CGFloat = 0
     let settingsStore: AssistantSettingsStore
-    /// Opens the Settings window (set by the app delegate).
-    @ObservationIgnored var openSettings: () -> Void = {}
+    /// Speech model downloads, shared with Settings › Speech so the island can offer the
+    /// first download in place (set by the app delegate).
+    @ObservationIgnored var speechModels: SpeechModelsController?
+    /// Opens the Settings window at a pane, or the last one viewed (set by the app delegate).
+    @ObservationIgnored var openSettings: (SettingsPane?) -> Void = { _ in }
+    /// Set when the question field should take keyboard focus (global Ask shortcut);
+    /// the island view clears it once the field has focus.
+    var wantsQuestionFocus = false
     /// Mirrors the SwiftUI environment (set by IslandView) so animation choice and view
     /// transitions always agree.
     @ObservationIgnored var reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
 
     @ObservationIgnored weak var panelHost: IslandPanelHosting?
     @ObservationIgnored private let service: AudioCaptureService
-    @ObservationIgnored private let transcriber: SystemAudioTranscriber
+    @ObservationIgnored private let transcriber: any SystemAudioTranscribing
     @ObservationIgnored private let replyService: ReplyService
     @ObservationIgnored private let screenshotter: any ScreenshotCapturing
     @ObservationIgnored private var askTask: Task<Void, Never>?
     @ObservationIgnored private var currentAskID: UUID?
+    /// Text of the reply being streamed, and the pending coalesced UI update.
+    @ObservationIgnored private var replyBuffer = ReplyTextCoalescer()
+    @ObservationIgnored private var replyFlushTask: Task<Void, Never>?
     @ObservationIgnored private var transitionID = 0
     @ObservationIgnored private var settledTransitionID = 0
     @ObservationIgnored private var accessoryTransitionID = 0
@@ -132,7 +153,7 @@ final class IslandViewModel {
     /// True while an open/close animation is still running.
     var hasPendingTransition: Bool { transitionID != settledTransitionID }
 
-    init(config: NotchPilotConfig, service: AudioCaptureService, transcriber: SystemAudioTranscriber,
+    init(config: NotchPilotConfig, service: AudioCaptureService, transcriber: any SystemAudioTranscribing,
          replyService: ReplyService, screenshotter: any ScreenshotCapturing, settingsStore: AssistantSettingsStore) {
         self.config = config
         self.service = service
@@ -186,13 +207,7 @@ final class IslandViewModel {
         if captureState.isActive {
             Task { await service.stop() }
         } else {
-            // Starting capture is the person's request to transcribe, so this is when the
-            // Speech Recognition prompt may appear (HIG › Privacy: request permission only
-            // when the feature needs it). It returns at once when already decided.
-            Task {
-                _ = await SystemAudioTranscriber.requestAuthorization()
-                await service.start()
-            }
+            Task { await service.start() }
         }
     }
 
@@ -200,25 +215,25 @@ final class IslandViewModel {
     func captureStateDidChange(to state: CaptureState) {
         captureState = state
         switch state {
-        case .running: transcriber.start()
+        case .running: startTranscriber()
         case .idle, .failed: transcriber.stop()
         case .starting, .stopping: break
         }
     }
 
-    /// "Continue" next to "Speech recognition needs permission": shows the system prompt.
-    func requestSpeechPermission() {
-        let transcriber = transcriber
-        Task { @MainActor [weak self] in
-            _ = await SystemAudioTranscriber.requestAuthorization()
-            if case .running = self?.captureState { transcriber.start() }
-        }
+    /// Settings › Speech changed the model or language (or the model finished downloading):
+    /// restart transcription with them if capture is running.
+    func speechSettingsDidChange() {
+        if case .running = captureState { startTranscriber() }
     }
 
-    func openSpeechPrivacySettings() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition") {
-            NSWorkspace.shared.open(url)
-        }
+    /// The whisper model chosen in Settings › Speech.
+    var selectedSpeechModel: SpeechModel {
+        SpeechModel.named(settingsStore.settings.speechModelID) ?? SpeechModel.named(SpeechModel.recommendedID)!
+    }
+
+    private func startTranscriber() {
+        transcriber.start(model: selectedSpeechModel, language: settingsStore.settings.speechLanguage)
     }
 
     func clearTranscript() {
@@ -229,6 +244,13 @@ final class IslandViewModel {
     // MARK: Ask
 
     var provider: AIProvider { settingsStore.settings.provider }
+
+    /// A reply is waiting while the island is collapsed; the compact island shows a badge
+    /// until the reply is seen or dismissed.
+    var hasReplyWhileCollapsed: Bool {
+        guard presentation == .compact, case .replied = askPhase else { return false }
+        return true
+    }
 
     /// Sends one request: optional on-demand screenshot, then the provider call. This is the
     /// only path that touches the network.
@@ -252,6 +274,8 @@ final class IslandViewModel {
         askPhase = wantsScreen ? .capturingScreen : .waiting(settings.provider)
         let id = UUID()
         currentAskID = id
+        resetReplyBuffer()
+        let provider = settings.provider
 
         askTask = Task { [weak self] in
             do {
@@ -268,9 +292,25 @@ final class IslandViewModel {
                                            question: trimmedQuestion.isEmpty ? nil : trimmedQuestion,
                                            screenshotJPEG: screenshot,
                                            systemPrompt: settings.systemPrompt)
-                let reply = try await replyService.reply(to: request, settings: settings)
-                try Task.checkCancellation()
-                self?.finishAsk(id, .replied(reply))
+                // Cancelling this task ends the stream, which cancels the network request.
+                var model = ""
+                for try await event in try replyService.streamReply(to: request, settings: settings) {
+                    try Task.checkCancellation()
+                    switch event {
+                    case .started(let name):
+                        model = name
+                    case .textDelta(let delta):
+                        self?.receive(delta, for: id, provider: provider, model: model)
+                    case .finished(let truncated):
+                        guard let self else { return }
+                        let text = self.replyBuffer.text
+                        guard !text.isEmpty || truncated else { throw AssistantError.invalidResponse(provider) }
+                        let reply = AssistantReply(text: text, provider: provider, model: model, truncated: truncated)
+                        self.finishAsk(id, .replied(reply, stoppedEarly: false))
+                        return
+                    }
+                }
+                throw AssistantError.invalidResponse(provider)
             } catch is CancellationError {
                 // cancelAsk() already reset the state for this Ask.
             } catch let error as AssistantError {
@@ -287,7 +327,21 @@ final class IslandViewModel {
         askTask?.cancel()
         askTask = nil
         currentAskID = nil
+        resetReplyBuffer()
         askPhase = .idle
+    }
+
+    /// Stop while text is arriving keeps what has arrived (so it can be read and copied);
+    /// before that it is the same as Cancel.
+    func stopReply() {
+        guard case .streaming(var reply) = askPhase else { return cancelAsk() }
+        reply.text = replyBuffer.text
+        askTask?.cancel()
+        askTask = nil
+        currentAskID = nil
+        resetReplyBuffer()
+        askPhase = .replied(reply, stoppedEarly: true)
+        AccessibilityNotification.Announcement("Reply stopped").post()
     }
 
     func dismissReply() {
@@ -296,14 +350,14 @@ final class IslandViewModel {
     }
 
     func copyReply() {
-        guard case .replied(let reply) = askPhase else { return }
+        guard case .replied(let reply, _) = askPhase else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(reply.text, forType: .string)
     }
 
     func performFix(_ fix: AskFailure.Fix) {
         switch fix {
-        case .openSettings: openSettings()
+        case .openSettings: openSettings(.assistant)
         case .openScreenPrivacySettings: openPrivacySettings()
         }
     }
@@ -312,6 +366,35 @@ final class IslandViewModel {
     /// the field receives typing.
     func beginTyping() {
         panelHost?.focusForKeyboard()
+    }
+
+    /// Global Ask shortcut: the island is open and key; put the cursor in the question field.
+    func requestQuestionFocus() {
+        wantsQuestionFocus = true
+    }
+
+    /// Appends a streamed delta; the visible text is updated at most ~30 times a second
+    /// (ReplyTextCoalescer), with a timer so trailing text shows even if the stream pauses.
+    private func receive(_ delta: String, for id: UUID, provider: AIProvider, model: String) {
+        guard currentAskID == id, !Task.isCancelled else { return }
+        if let text = replyBuffer.append(delta, at: .now) {
+            askPhase = .streaming(AssistantReply(text: text, provider: provider, model: model))
+        } else if replyFlushTask == nil, let deadline = replyBuffer.pendingDeadline {
+            replyFlushTask = Task { [weak self] in
+                try? await Task.sleep(until: deadline, clock: .continuous)
+                guard let self, !Task.isCancelled, self.currentAskID == id else { return }
+                self.replyFlushTask = nil
+                if let text = self.replyBuffer.flush(at: .now) {
+                    self.askPhase = .streaming(AssistantReply(text: text, provider: provider, model: model))
+                }
+            }
+        }
+    }
+
+    private func resetReplyBuffer() {
+        replyFlushTask?.cancel()
+        replyFlushTask = nil
+        replyBuffer = ReplyTextCoalescer()
     }
 
     private func updateAsk(_ id: UUID, _ phase: AskPhase) {
@@ -323,10 +406,12 @@ final class IslandViewModel {
         guard currentAskID == id, !Task.isCancelled else { return }
         currentAskID = nil
         askTask = nil
+        resetReplyBuffer()
         askPhase = phase
-        // VoiceOver hears the outcome even while the island is collapsed.
+        // VoiceOver hears the outcome once, when the reply is complete (never per delta),
+        // even while the island is collapsed.
         let announcement = switch phase {
-        case .replied(let reply): "\(reply.provider.displayName) replied"
+        case .replied(let reply, _): "\(reply.provider.displayName) replied"
         case .failed(let failure): failure.title
         default: ""
         }
@@ -338,7 +423,9 @@ final class IslandViewModel {
         let target: CGFloat = switch askPhase {
         case .idle: 0
         case .capturingScreen, .waiting, .failed: layout.expandedNoticeHeight
-        case .replied: layout.expandedReplyHeight
+        // Full reply height from the first streamed delta, so the island grows once
+        // rather than line by line.
+        case .streaming, .replied: layout.expandedReplyHeight
         }
         guard target != accessoryHeight else { return }
         accessoryTransitionID += 1

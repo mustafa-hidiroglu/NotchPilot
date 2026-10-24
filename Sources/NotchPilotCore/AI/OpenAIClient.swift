@@ -13,22 +13,18 @@ public struct OpenAIClient: ReplyGenerating {
         self.session = session ?? ProviderHTTP.defaultSession
     }
 
-    public func reply(to request: ReplyRequest, apiKey: String, settings: AssistantSettings) async throws -> AssistantReply {
-        let urlRequest = try ProviderHTTP.jsonRequest(
-            url: Self.endpoint,
-            headers: ["Authorization": "Bearer \(apiKey)"],
-            body: Self.body(for: request, settings: settings)
-        )
-        let data = try await ProviderHTTP.send(urlRequest, session: session, provider: provider)
-        guard let response = try? JSONDecoder().decode(CompletionResponse.self, from: data),
-              let choice = response.choices.first
-        else { throw AssistantError.invalidResponse(provider) }
-        if choice.message.refusal != nil { throw AssistantError.refused(provider) }
-        // Empty content (e.g. the whole budget went to reasoning) is not a usable reply.
-        guard let text = choice.message.content,
-              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { throw AssistantError.invalidResponse(provider) }
-        return AssistantReply(text: text, provider: provider, model: response.model, truncated: choice.finishReason == "length")
+    public func streamReply(to request: ReplyRequest, apiKey: String, settings: AssistantSettings) -> AsyncThrowingStream<ReplyEvent, Error> {
+        let urlRequest: URLRequest
+        do {
+            urlRequest = try ProviderHTTP.jsonRequest(
+                url: Self.endpoint,
+                headers: ["Authorization": "Bearer \(apiKey)"],
+                body: Self.body(for: request, settings: settings)
+            )
+        } catch {
+            return AsyncThrowingStream { $0.finish(throwing: AssistantError.invalidResponse(provider)) }
+        }
+        return ProviderHTTP.replyStream(urlRequest, session: session, provider: provider, decoder: StreamDecoder())
     }
 
     static func body(for request: ReplyRequest, settings: AssistantSettings) -> CompletionRequest {
@@ -49,9 +45,10 @@ public struct OpenAIClient: ReplyGenerating {
         var model: String
         var maxCompletionTokens: Int
         var messages: [Message]
+        var stream = true
 
         enum CodingKeys: String, CodingKey {
-            case model, messages
+            case model, messages, stream
             case maxCompletionTokens = "max_completion_tokens"
         }
     }
@@ -98,21 +95,81 @@ public struct OpenAIClient: ReplyGenerating {
         }
     }
 
-    struct CompletionResponse: Decodable {
+    /// Chat Completions streaming chunks: one JSON object per `data:` line, ended by
+    /// `data: [DONE]`.
+    struct StreamDecoder: ReplyStreamDecoding {
+        private var started = false
+        private var text = ""
+        private var finishReason: String?
+
+        mutating func decode(_ event: ServerSentEvent) throws -> [ReplyEvent] {
+            if event.data == "[DONE]" {
+                let truncated = finishReason == "length"
+                // Blank content on a complete reply is not usable. A blank truncated one (the whole
+                // budget went to reasoning) finishes like Claude's: the person sees it was cut off.
+                guard truncated || !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw AssistantError.invalidResponse(.openAI)
+                }
+                return [.finished(truncated: truncated)]
+            }
+            guard let chunk = try? JSONDecoder().decode(Chunk.self, from: Data(event.data.utf8)) else {
+                throw AssistantError.invalidResponse(.openAI)
+            }
+            if let error = chunk.error { throw Self.error(error) }
+
+            var events: [ReplyEvent] = []
+            if !started {
+                started = true
+                events.append(.started(model: chunk.model ?? ""))
+            }
+            guard let choice = chunk.choices?.first else { return events }
+            if let refusal = choice.delta?.refusal, !refusal.isEmpty { throw AssistantError.refused(.openAI) }
+            if let content = choice.delta?.content, !content.isEmpty {
+                text += content
+                events.append(.textDelta(content))
+            }
+            if let reason = choice.finishReason {
+                if reason == "content_filter" { throw AssistantError.refused(.openAI) }
+                finishReason = reason
+            }
+            return events
+        }
+
+        /// Maps an error object that arrived mid-stream through its HTTP status equivalent.
+        static func error(_ error: Chunk.ErrorDetail) -> AssistantError {
+            let kind = error.code ?? error.type ?? ""
+            let status = switch kind {
+            case "invalid_api_key", "authentication_error": 401
+            case "rate_limit_exceeded", "insufficient_quota": 429
+            case "invalid_request_error", "model_not_found", "context_length_exceeded": 400
+            default: 500 // server_error and unknown kinds
+            }
+            return ProviderHTTP.error(status: status, message: error.message, provider: .openAI)
+                ?? .providerUnavailable(.openAI, status: status)
+        }
+    }
+
+    struct Chunk: Decodable {
         struct Choice: Decodable {
-            struct Message: Decodable {
+            struct Delta: Decodable {
                 var content: String?
                 var refusal: String?
             }
-            var message: Message
+            var delta: Delta?
             var finishReason: String?
 
             enum CodingKeys: String, CodingKey {
-                case message
+                case delta
                 case finishReason = "finish_reason"
             }
         }
-        var model: String
-        var choices: [Choice]
+        struct ErrorDetail: Decodable {
+            var message: String?
+            var type: String?
+            var code: String?
+        }
+        var model: String?
+        var choices: [Choice]?
+        var error: ErrorDetail?
     }
 }
