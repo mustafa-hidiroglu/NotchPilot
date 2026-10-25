@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build whisper.cpp from pinned upstream source into a static, universal (arm64 + x86_64)
+# Build whisper.cpp from pinned upstream source into a static, Apple silicon (arm64)
 # Vendor/whisper.xcframework that Package.swift links as the `whisper` module.
 #
 # Usage: scripts/build-whisper.sh [--force] [--help]
@@ -16,7 +16,7 @@ set -euo pipefail
 WHISPER_TAG=v1.9.5
 WHISPER_COMMIT=d1be6fde11ac6e0407606b4e42fe72d34add8037
 # Bump when the cmake flags or packaging below change, to force a rebuild.
-CONFIG_VERSION=1
+CONFIG_VERSION=2
 MACOS_MIN=14.0
 
 FORCE=0
@@ -65,18 +65,21 @@ actual=$(git -C "$SRC" rev-parse HEAD)
 [[ "$actual" == "$WHISPER_COMMIT" ]] || die "whisper.cpp $WHISPER_TAG is commit $actual, expected $WHISPER_COMMIT; refusing to build"
 echo "    verified commit $actual"
 
-echo "==> building whisper.cpp (static, arm64 + x86_64, macOS $MACOS_MIN)"
+echo "==> building whisper.cpp (static, arm64, macOS $MACOS_MIN)"
 rm -rf "$WORK"
 # Flags follow upstream's build-xcframework.sh for macOS, minus Core ML (NotchPilot uses
 # plain ggml models) and parakeet. Metal is embedded (no .metallib to ship); Accelerate
-# provides BLAS. Metal is enabled for both slices; at runtime NotchPilot only asks for the
-# GPU on Apple silicon.
+# provides BLAS. NotchPilot targets Apple silicon only: Metal runs the model on every
+# M-series GPU, and the CPU kernels are compiled for the M1 baseline (-mcpu=apple-m1:
+# ARMv8.5 with NEON, fp16 and dot-product), which every later Apple chip runs natively.
+# A per-chip CPU build (e.g. i8mm on M2+) would need ggml's dynamically loaded backends,
+# which a statically linked app can't use; the CPU only handles the light work anyway.
 cmake -S "$SRC" -B "$WORK" -G "Unix Makefiles" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+    -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS_MIN" \
-    -DCMAKE_C_FLAGS="-Wno-macro-redefined -Wno-shorten-64-to-32 -Wno-unused-command-line-argument" \
-    -DCMAKE_CXX_FLAGS="-Wno-macro-redefined -Wno-shorten-64-to-32 -Wno-unused-command-line-argument" \
+    -DCMAKE_C_FLAGS="-mcpu=apple-m1 -Wno-macro-redefined -Wno-shorten-64-to-32 -Wno-unused-command-line-argument" \
+    -DCMAKE_CXX_FLAGS="-mcpu=apple-m1 -Wno-macro-redefined -Wno-shorten-64-to-32 -Wno-unused-command-line-argument" \
     -DBUILD_SHARED_LIBS=OFF \
     -DWHISPER_BUILD_EXAMPLES=OFF \
     -DWHISPER_BUILD_TESTS=OFF \
@@ -107,9 +110,7 @@ echo "==> packaging $OUT"
 STAGE="$WORK/package"
 mkdir -p "$STAGE/include"
 libtool -static -no_warning_for_no_symbols -o "$STAGE/libwhisper.a" "${LIBS[@]}"
-for arch in arm64 x86_64; do
-    lipo "$STAGE/libwhisper.a" -verify_arch "$arch" || die "libwhisper.a lacks $arch"
-done
+lipo "$STAGE/libwhisper.a" -verify_arch arm64 || die "libwhisper.a lacks arm64"
 cp "$SRC/include/whisper.h" \
    "$SRC/ggml/include/ggml.h" "$SRC/ggml/include/ggml-alloc.h" "$SRC/ggml/include/ggml-backend.h" \
    "$SRC/ggml/include/ggml-metal.h" "$SRC/ggml/include/ggml-cpu.h" "$SRC/ggml/include/ggml-blas.h" \
@@ -141,7 +142,7 @@ MODULEMAP
 # `xcodebuild -create-xcframework -library … -headers …` produces), so the build needs
 # only the command line tools, not a working Xcode plug-in setup.
 rm -rf "$OUT"
-SLICE=macos-arm64_x86_64
+SLICE=macos-arm64
 mkdir -p "$OUT/$SLICE/Headers"
 cp "$STAGE/libwhisper.a" "$OUT/$SLICE/libwhisper.a"
 cp "$STAGE/include/"* "$OUT/$SLICE/Headers/"
@@ -164,7 +165,6 @@ cat > "$OUT/Info.plist" <<PLIST
             <key>SupportedArchitectures</key>
             <array>
                 <string>arm64</string>
-                <string>x86_64</string>
             </array>
             <key>SupportedPlatform</key>
             <string>macos</string>

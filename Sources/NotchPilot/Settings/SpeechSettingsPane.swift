@@ -82,14 +82,12 @@ struct SpeechSettingsPane: View {
         Binding(get: { confirmingDelete != nil }, set: { if !$0 { confirmingDelete = nil } })
     }
 
-    /// Intel Macs still see every model, but the two that need Metal say so up front
-    /// (HIG › Generative AI: set clear expectations about limitations).
+    /// Every model stays selectable; one that is best with more memory than this Mac has
+    /// says so up front (HIG › Generative AI: set clear expectations about limitations).
     static func pickerLabel(_ model: SpeechModel) -> String {
         var label = model.displayName
         if model.id == SpeechModel.recommendedID { label += " (Recommended)" }
-        #if !arch(arm64)
-        if ["small", "large-v3-turbo"].contains(model.id) { label += " — needs Apple silicon" }
-        #endif
+        if !model.fitsThisMac, let memory = model.recommendedMemoryGB { label += " — best with \(memory) GB memory" }
         return label
     }
 

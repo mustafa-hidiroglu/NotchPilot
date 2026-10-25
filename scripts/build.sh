@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build NotchPilot and assemble a signed build/NotchPilot.app bundle.
 #
-# Usage: scripts/build.sh [--debug] [--universal] [--run] [--help]
+# Usage: scripts/build.sh [--debug] [--run] [--help]
 # Env:   CODESIGN_IDENTITY  signing identity (default "-" = ad-hoc)
 #
 # The app is not sandboxed and ScreenCaptureKit needs no entitlement (the permission is
@@ -10,21 +10,22 @@
 # No entitlements file is used. whisper.cpp is linked statically into the executable
 # (scripts/build-whisper.sh builds it from pinned source on first use), so the bundle
 # contains no third-party dylib and the hardened runtime's library validation stays on.
+#
+# Apple silicon only: the executable is arm64 (every M-series Mac); Intel Macs can't open it.
 set -euo pipefail
 
 CONFIG=release
 RUN=0
-UNIVERSAL=0
 
 usage() {
     cat <<USAGE
-Usage: scripts/build.sh [--debug] [--universal] [--run] [--help]
+Usage: scripts/build.sh [--debug] [--run] [--help]
 
-  --debug      build the debug configuration instead of release
-  --universal  build for both Apple silicon and Intel (use this when the app
-               is for someone else's Mac)
-  --run        open the app after building
-  --help       show this message
+  --debug   build the debug configuration instead of release
+  --run     open the app after building
+  --help    show this message
+
+Builds an Apple silicon (arm64) app that runs on any M-series Mac with macOS 14+.
 
 Environment:
   CODESIGN_IDENTITY  signing identity (default: "-", ad-hoc)
@@ -34,7 +35,6 @@ USAGE
 for arg in "$@"; do
     case "$arg" in
         --debug) CONFIG=debug ;;
-        --universal) UNIVERSAL=1 ;;
         --run) RUN=1 ;;
         --help|-h) usage; exit 0 ;;
         *) echo "error: unknown option '$arg'" >&2; usage >&2; exit 2 ;;
@@ -65,10 +65,8 @@ IDENTITY=${CODESIGN_IDENTITY:--}
 
 "$ROOT/scripts/build-whisper.sh"
 
-BUILD_ARGS=(-c "$CONFIG")
-if (( UNIVERSAL )); then
-    BUILD_ARGS+=(--arch arm64 --arch x86_64)
-fi
+# Explicit, so a Terminal running under Rosetta still produces an arm64 app.
+BUILD_ARGS=(-c "$CONFIG" --arch arm64)
 
 echo "==> swift build ${BUILD_ARGS[*]} --product NotchPilot"
 swift build "${BUILD_ARGS[@]}" --product NotchPilot
@@ -82,11 +80,7 @@ cp "$BIN_DIR/NotchPilot" "$APP/Contents/MacOS/NotchPilot"
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist"
 
-if (( UNIVERSAL )); then
-    for arch in arm64 x86_64; do
-        lipo "$APP/Contents/MacOS/NotchPilot" -verify_arch "$arch" || die "executable lacks $arch"
-    done
-fi
+lipo "$APP/Contents/MacOS/NotchPilot" -verify_arch arm64 || die "executable is not arm64"
 
 echo "==> codesign (identity: $IDENTITY)"
 # A real identity gets a secure timestamp (needed for notarization and for the signature

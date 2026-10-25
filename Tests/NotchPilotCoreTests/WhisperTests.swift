@@ -662,7 +662,9 @@ struct WhisperTranscriberTests {
 
 // MARK: - Real model (opt-in)
 
-@Suite("Whisper integration")
+/// Serialized: the memory test measures the whole process, so no other model may be
+/// loaded alongside it, and all tests share one download folder.
+@Suite("Whisper integration", .serialized)
 struct WhisperIntegrationTests {
     static let enabled = ProcessInfo.processInfo.environment["NOTCHPILOT_WHISPER_INTEGRATION"] == "1"
 
@@ -749,6 +751,83 @@ struct WhisperIntegrationTests {
         store.fileURL = nil
         transcriber.start(model: model, language: "auto")   // same model and language
         #expect(await first(transcriber.states) { $0 == .needsModel } == .needsModel)
+        #expect(!transcriber.isModelLoaded)
+    }
+
+    /// Process memory as Activity Monitor's "Memory" column counts it (phys_footprint),
+    /// plus the peak so far, in MB.
+    static func footprintMB() -> (current: Double, peak: Double) {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
+        }
+        guard result == KERN_SUCCESS else { return (0, 0) }
+        return (Double(info.phys_footprint) / 1_048_576, Double(info.ledger_phys_footprint_peak) / 1_048_576)
+    }
+
+    @Test("memory: a loaded model fits an 8 GB Mac, and stopping frees it after the idle delay",
+          .enabled(if: enabled, "Set NOTCHPILOT_WHISPER_INTEGRATION=1 (and optionally NOTCHPILOT_WHISPER_MODEL=base|small) to measure memory with a real model"),
+          .timeLimit(.minutes(10)))
+    func memoryBudgetAndIdleUnload() async throws {
+        let id = ProcessInfo.processInfo.environment["NOTCHPILOT_WHISPER_MODEL"] ?? "tiny"
+        let model = try #require(SpeechModel.named(id))
+        let directory = FileManager.default.temporaryDirectory.appending(path: "NotchPilotWhisperIntegration", directoryHint: .isDirectory)
+        let store = SpeechModelStore(directory: directory)
+        try await store.download(model)
+        let before = Self.footprintMB().current
+
+        let transcriber = WhisperTranscriber(modelStore: store, windowConfiguration: .default, idleUnloadDelay: .seconds(1))
+        defer { transcriber.shutdown() }
+        transcriber.start(model: model, language: "en")
+        #expect(await first(transcriber.states, timeout: .seconds(60)) { $0 == .listening } == .listening)
+
+        // One full 15 s window of speech-level noise, so whisper allocates its working buffers.
+        var noise = [Float](repeating: 0, count: 16_000)
+        for i in noise.indices { noise[i] = Float.random(in: -0.2...0.2) }
+        for _ in 0..<15 {
+            noise.withUnsafeBufferPointer { transcriber.process($0, frames: 16_000, format: PCMFormat(sampleRate: 16_000, channelCount: 1)) }
+            try await Task.sleep(for: .milliseconds(200))
+        }
+        try await Task.sleep(for: .seconds(3))
+        let loaded = Self.footprintMB()
+        print(String(format: "whisper memory [%@]: before %.0f MB, loaded %.0f MB (model + buffers %.0f MB), peak %.0f MB",
+                     model.id, before, loaded.current, loaded.current - before, loaded.peak))
+        // Budget for the default model on an 8 GB Mac shared with other apps.
+        if model.id == SpeechModel.recommendedID { #expect(loaded.current - before < 450) }   // measured ~330 MB in a fresh process
+
+        transcriber.stop()
+        #expect(transcriber.isModelLoaded)   // still loaded right after stop
+        try await Task.sleep(for: .seconds(3))
+        #expect(!transcriber.isModelLoaded)  // freed after the idle delay
+        let after = Self.footprintMB().current
+        print(String(format: "whisper memory [%@]: after idle unload %.0f MB", model.id, after))
+    }
+
+    @Test("an earlier stop's idle unload doesn't fire after start and a second stop",
+          .enabled(if: enabled, "Set NOTCHPILOT_WHISPER_INTEGRATION=1 to download ggml-tiny.bin (78 MB) from huggingface.co and run whisper"),
+          .timeLimit(.minutes(10)))
+    func restartCancelsIdleUnload() async throws {
+        let model = try #require(SpeechModel.named("tiny"))
+        let directory = FileManager.default.temporaryDirectory.appending(path: "NotchPilotWhisperIntegration", directoryHint: .isDirectory)
+        let store = SpeechModelStore(directory: directory)
+        try await store.download(model)
+        let transcriber = WhisperTranscriber(modelStore: store, windowConfiguration: .default, idleUnloadDelay: .seconds(2))
+        defer { transcriber.shutdown() }
+        transcriber.start(model: model, language: "en")
+        #expect(await first(transcriber.states, timeout: .seconds(60)) { $0 == .listening } == .listening)
+        // stop (schedules unload at t+2 s), start, stop again at ~t+1 s (schedules t+3 s).
+        transcriber.stop()
+        try await Task.sleep(for: .milliseconds(500))
+        transcriber.start(model: model, language: "en")
+        #expect(await first(transcriber.states) { $0 == .listening } == .listening)
+        try await Task.sleep(for: .milliseconds(500))
+        transcriber.stop()
+        // Past the first stop's deadline: only the token keeps that unload from firing.
+        try await Task.sleep(for: .milliseconds(1_500))
+        #expect(transcriber.isModelLoaded)
+        // Past the second stop's deadline: now it is freed.
+        try await Task.sleep(for: .seconds(2))
         #expect(!transcriber.isModelLoaded)
     }
 }

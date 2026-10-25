@@ -14,7 +14,7 @@ import Foundation
 ///   silence); it is trimmed to a short pre-roll so the start of the next word survives.
 /// * At most one inference runs at a time. If one takes longer than `step`, the next one
 ///   simply starts with the newest audio when it finishes, instead of a backlog forming.
-/// * Memory is bounded even when whisper can't keep up (Intel, large models): while a pass
+/// * Memory is bounded even when whisper can't keep up (large models on a busy Mac): while a pass
 ///   runs, at most 2 × `maxWindow` is held (the audio being transcribed plus the newest
 ///   `maxWindow`); older audio is dropped. Each pass covers at most `maxWindow`.
 ///
@@ -33,14 +33,9 @@ struct WhisperWindowing {
         /// Audio kept ahead of the first speech frame.
         var preRoll: Double = 0.3
 
-        /// 1 s on Apple silicon (Metal keeps up), 2 s on Intel (CPU only).
-        static var `default`: Configuration {
-            #if arch(arm64)
-            Configuration(step: 1.0)
-            #else
-            Configuration(step: 2.0)
-            #endif
-        }
+        /// A partial pass every second: Metal finishes a 15 s window well inside that on an
+        /// M1, and a shorter step would mostly spend battery on a fanless Air.
+        static var `default`: Configuration { Configuration(step: 1.0) }
 
         var frameSamples: Int { max(1, Int(Double(sampleRate) * frame)) }
         var stepSamples: Int { Int(Double(sampleRate) * step) }

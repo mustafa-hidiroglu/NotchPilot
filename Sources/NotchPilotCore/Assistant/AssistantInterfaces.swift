@@ -295,7 +295,7 @@ public protocol SystemAudioTranscribing: PCMBlockProcessor, Sendable {
 public struct SpeechModel: Sendable, Equatable, Identifiable {
     public let id: String
     public let displayName: String
-    /// One line for Settings, e.g. "Fastest. Good for Intel Macs."
+    /// One line for Settings, e.g. "Fastest, least accurate."
     public let summary: String
     public let fileName: String
     public let sizeBytes: Int64
@@ -311,27 +311,38 @@ public struct SpeechModel: Sendable, Equatable, Identifiable {
 
     /// Multilingual models only, so `speechLanguage` can be anything whisper supports.
     public static let catalog: [SpeechModel] = [
-        SpeechModel(id: "tiny", displayName: "Tiny", summary: "Fastest, least accurate. Best for Intel Macs.",
+        SpeechModel(id: "tiny", displayName: "Tiny", summary: "Fastest, least accurate. About 250 MB while transcribing.",
                     fileName: "ggml-tiny.bin", sizeBytes: 77_691_713,
                     sha256: "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21"),
-        SpeechModel(id: "base", displayName: "Base", summary: "Fast and accurate enough for most speech.",
+        SpeechModel(id: "base", displayName: "Base", summary: "Fast and accurate enough for most speech. About 350 MB while transcribing.",
                     fileName: "ggml-base.bin", sizeBytes: 147_951_465,
                     sha256: "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe"),
-        SpeechModel(id: "small", displayName: "Small", summary: "More accurate; needs an Apple silicon Mac.",
+        SpeechModel(id: "small", displayName: "Small", summary: "More accurate, slower to update. About 800 MB while transcribing.",
                     fileName: "ggml-small.bin", sizeBytes: 487_601_967,
                     sha256: "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"),
-        SpeechModel(id: "large-v3-turbo", displayName: "Large Turbo", summary: "Most accurate; for M-series Macs with 16 GB.",
+        SpeechModel(id: "large-v3-turbo", displayName: "Large Turbo", summary: "Most accurate, slowest to update. About 800 MB while transcribing.",
                     fileName: "ggml-large-v3-turbo-q5_0.bin", sizeBytes: 574_041_195,
                     sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"),
     ]
 
-    /// "base" on Apple silicon (Metal keeps it real-time), "tiny" on Intel (CPU only).
-    public static var recommendedID: String {
-        #if arch(arm64)
-        "base"
-        #else
-        "tiny"
-        #endif
+    /// Real-time on every Apple silicon Mac, including an 8 GB M1 Air, and accurate enough
+    /// for most speech.
+    public static let recommendedID = "base"
+
+    // Memory figures in the summaries were measured on Apple silicon with the app's own
+    // footprint (phys_footprint) while transcribing; loading peaks briefly higher (about
+    // 0.45 GB for Base, 1.2–1.3 GB for Small and Large Turbo). Every model runs on an 8 GB
+    // Mac; the slowest one is flagged there because it competes hardest with other apps.
+
+    /// Memory a model is best run with next to other apps, or nil when any Apple silicon
+    /// Mac (8 GB and up) is comfortable.
+    public var recommendedMemoryGB: Int? { id == "large-v3-turbo" ? 16 : nil }
+
+    /// False when this Mac has less memory than `recommendedMemoryGB`.
+    public var fitsThisMac: Bool {
+        guard let minimum = recommendedMemoryGB else { return true }
+        // Macs report slightly under their nominal size; compare against 15/16 of it.
+        return ProcessInfo.processInfo.physicalMemory >= UInt64(minimum) * 1_073_741_824 / 16 * 15
     }
 
     public static func named(_ id: String) -> SpeechModel? { catalog.first { $0.id == id } }

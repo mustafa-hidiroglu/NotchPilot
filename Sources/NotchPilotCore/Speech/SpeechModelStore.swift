@@ -283,9 +283,13 @@ public final class SpeechModelStore: SpeechModelManaging, @unchecked Sendable {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         var hasher = SHA256()
-        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+        // Each chunk is autoreleased; drain per chunk so memory stays at 1 MiB instead of
+        // growing to the whole file (574 MB for Large Turbo) until the loop ends.
+        while try autoreleasepool(invoking: { () throws -> Bool in
+            guard let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty else { return false }
             hasher.update(data: chunk)
-        }
+            return true
+        }) {}
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 }

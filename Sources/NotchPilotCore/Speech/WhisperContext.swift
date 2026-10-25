@@ -36,32 +36,46 @@ final class WhisperContext {
         case rejected
     }
 
-    /// Loads `model` from `fileURL`. Uses Metal on Apple silicon and the CPU on Intel.
+    /// Loads `model` from `fileURL` onto the GPU (Metal) with flash attention.
     ///
-    /// The exact bytes whisper parses are hashed first: the file is read into memory once
-    /// (no mapping, so it can't change between check and use), its SHA-256 compared with
-    /// `model.sha256`, and only then handed to whisper, which copies the weights into its
-    /// own buffers. The read copy is released as soon as init returns. Peak memory during
-    /// load is therefore about twice the file size (up to ~1 GB for Small, ~1.1 GB for
-    /// Large Turbo), for a second or two; steady state is whisper's copy alone.
+    /// The exact bytes whisper parses are hashed first: the file is read once into private
+    /// anonymous memory (so it can't change between check and use), hashed while it is
+    /// read, compared with `model.sha256`, and only then handed to whisper, which copies the
+    /// weights into its own buffers. The private copy is unmapped as soon as init returns.
+    /// It is mapped and unmapped explicitly rather than held in `Data`, because a freed
+    /// `Data` of this size stayed in the process footprint (measured: ~490 MB for Small),
+    /// which matters on an 8 GB Mac. Peak memory during load is about the file size plus
+    /// whisper's copy, for a second or two.
     init(model: SpeechModel, fileURL: URL) throws(LoadError) {
         _ = Self.quietLogs
         var params = whisper_context_default_params()
-        #if arch(arm64)
+        // Upstream's defaults today, set explicitly because NotchPilot depends on them:
+        // Metal for the encoder and decoder, and flash attention, which Metal accelerates.
         params.use_gpu = true
-        #else
-        params.use_gpu = false
-        #endif
-        let loaded: OpaquePointer? = try autoreleasepool { () throws(LoadError) -> OpaquePointer? in
-            // `var` so the mutable-pointer call below needs no second copy (whisper takes a
-            // non-const pointer but only reads through it).
-            guard var bytes = try? Data(contentsOf: fileURL, options: []) else { throw .unreadable }
-            let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
-            guard digest == model.sha256 else { throw .damaged }
-            return bytes.withUnsafeMutableBytes { buffer in
-                buffer.baseAddress.flatMap { whisper_init_from_buffer_with_params($0, buffer.count, params) }
-            }
+        params.flash_attn = true
+
+        let fd = open(fileURL.path(percentEncoded: false), O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else { throw .unreadable }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_size > 0 else { throw .unreadable }
+        let size = Int(info.st_size)
+        guard let memory = mmap(nil, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0),
+              memory != MAP_FAILED else { throw .unreadable }
+        defer { munmap(memory, size) }
+
+        var hasher = SHA256()
+        var offset = 0
+        while offset < size {
+            let count = read(fd, memory + offset, min(1 << 20, size - offset))
+            if count < 0, errno == EINTR { continue }
+            guard count > 0 else { throw .unreadable }
+            hasher.update(bufferPointer: UnsafeRawBufferPointer(start: memory + offset, count: count))
+            offset += count
         }
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        guard digest == model.sha256 else { throw .damaged }
+        let loaded = whisper_init_from_buffer_with_params(memory, size, params)
         guard let loaded else { throw .rejected }
         context = loaded
         modelID = model.id
@@ -133,8 +147,15 @@ final class WhisperContext {
         return Transcription(text: text.trimmingCharacters(in: .whitespacesAndNewlines), language: detected)
     }
 
-    /// Worker threads for inference: up to 4, leaving one core for capture and the UI.
-    static var threadCount: Int {
-        min(4, max(1, ProcessInfo.processInfo.activeProcessorCount - 1))
-    }
+    /// CPU threads for the work Metal doesn't take (mel spectrogram, sampling): the
+    /// performance cores, at most 4 (all four on an M1), so efficiency cores stay free for
+    /// capture and the UI.
+    static let threadCount: Int = {
+        var cores: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        if sysctlbyname("hw.perflevel0.physicalcpu", &cores, &size, nil, 0) != 0 || cores < 1 {
+            cores = Int32(max(1, ProcessInfo.processInfo.activeProcessorCount / 2))
+        }
+        return min(4, Int(cores))
+    }()
 }

@@ -20,6 +20,7 @@ NotchPilot is a macOS menu-bar utility with a Dynamic-Island-inspired panel at t
 
 | Requirement | Detail |
 |---|---|
+| Mac | Apple silicon (any M-series chip), 8 GB of memory or more. Intel Macs are not supported |
 | macOS | 14 or later (`platforms: [.macOS(.v14)]`) |
 | Toolchain | Xcode 16+ / Swift 6.0+ with Swift/C++ interoperability (available since Swift 5.9) |
 | CMake | 3.28+ (`brew install cmake`), to build whisper.cpp from source on first build; plus `git` |
@@ -40,13 +41,12 @@ If you add the sources to an Xcode project, set **C++ and Objective-C Interopera
 Scripts (`scripts/`):
 
 ```sh
-scripts/build.sh            # release build, assembles and signs NotchPilot.app
+scripts/build.sh            # release build (arm64), assembles and signs NotchPilot.app
 scripts/build.sh --debug    # debug build (enables the C++ ownership asserts)
 scripts/build.sh --run      # build, then launch the app
-scripts/build.sh --universal  # Apple silicon + Intel in one app (use this for someone else's Mac)
 scripts/build-whisper.sh     # build Vendor/whisper.xcframework from pinned source (build.sh/test.sh run it when missing)
 scripts/build.sh --help
-scripts/test.sh             # swift test (167 Swift tests) + C++ tests under TSan and ASan/UBSan
+scripts/test.sh             # swift test (172 Swift tests) + C++ tests under TSan and ASan/UBSan
 scripts/test.sh --cpp-only  # C++ tests only
 ```
 
@@ -58,11 +58,11 @@ CODESIGN_IDENTITY="Apple Development: Your Name (TEAMID)" scripts/build.sh --run
 
 `Resources/Info.plist` sets `LSUIElement` (no Dock icon) and bundle identifier `app.notchpilot.NotchPilot`. It has no usage-description keys: Screen & System Audio Recording has no Info.plist key, transcription needs no permission (whisper.cpp runs in-process), and NotchPilot never touches the microphone or camera.
 
-**whisper.cpp.** whisper.cpp is built from source and linked statically into the executable. `scripts/build-whisper.sh` clones upstream tag `v1.9.5`, refuses to build unless the checked-out commit is exactly `d1be6fde11ac6e0407606b4e42fe72d34add8037`, compiles it with CMake for arm64 and x86_64 (macOS 14, Metal with the shader library embedded, Accelerate for BLAS), and packages one static library as `Vendor/whisper.xcframework`, which `Package.swift` uses as the `whisper` binary target. A stamp file records the commit, so later runs skip the work; `--force` rebuilds. `scripts/build.sh` and `scripts/test.sh` run it automatically when the framework is missing; that first build compiles whisper.cpp, which took about 20 s on a 10-core Apple silicon Mac (allow a few minutes on slower machines). The app bundle therefore contains no third-party dylib, needs no entitlements, and keeps the hardened runtime's library validation on, including for ad-hoc builds (`otool -L build/NotchPilot.app/Contents/MacOS/NotchPilot` lists only system libraries).
+**whisper.cpp.** whisper.cpp is built from source and linked statically into the executable. `scripts/build-whisper.sh` clones upstream tag `v1.9.5`, refuses to build unless the checked-out commit is exactly `d1be6fde11ac6e0407606b4e42fe72d34add8037`, compiles it with CMake for arm64 only (macOS 14, Metal with the shader library embedded, Accelerate for BLAS, CPU code for the M1 baseline `-mcpu=apple-m1`, which every later Apple chip runs natively; the model itself runs on the GPU, which adapts to each chip), and packages one static library as `Vendor/whisper.xcframework`, which `Package.swift` uses as the `whisper` binary target. A stamp file records the commit, so later runs skip the work; `--force` rebuilds. `scripts/build.sh` and `scripts/test.sh` run it automatically when the framework is missing; that first build compiles whisper.cpp, which took about 15 s on a 10-core Apple silicon Mac (allow a few minutes on slower machines). The app bundle therefore contains no third-party dylib, needs no entitlements, and keeps the hardened runtime's library validation on, including for ad-hoc builds (`otool -L build/NotchPilot.app/Contents/MacOS/NotchPilot` lists only system libraries).
 
 ### Giving the app to someone else
 
-Build with `scripts/build.sh --universal`. The app then contains both arm64 and x86_64 code (`lipo -archs build/NotchPilot.app/Contents/MacOS/NotchPilot` prints both), so it runs on Apple silicon and Intel Macs with macOS 14 or later. Zip it (`ditto -c -k --keepParent build/NotchPilot.app NotchPilot.zip`) and send it.
+Build with `scripts/build.sh`. The app is arm64 (`lipo -archs build/NotchPilot.app/Contents/MacOS/NotchPilot` prints `arm64`) and runs on any Apple silicon Mac (M1 or later) with macOS 14 or later; Intel Macs can't open it. Zip it (`ditto -c -k --keepParent build/NotchPilot.app NotchPilot.zip`) and send it.
 
 The ad-hoc signed app is not notarized, so on the other Mac Gatekeeper blocks the first launch:
 
@@ -70,15 +70,13 @@ The ad-hoc signed app is not notarized, so on the other Mac Gatekeeper blocks th
 2. Open System Settings > Privacy & Security, scroll to Security, and click **Open Anyway** next to the NotchPilot message. Confirm with your password, then **Open**.
 3. From then on it opens normally. Settings › Speech downloads the recommended speech model on first use.
 
-The Intel build is compiled and packaged, but has not been run on an Intel Mac.
-
 Raw SwiftPM equivalents:
 
 ```sh
 swift build                 # debug
 swift build -c release
 swift run NotchPilot        # runs the bare executable (no app bundle)
-swift test                  # Swift tests (NotchPilotCoreTests, 167 tests)
+swift test                  # Swift tests (NotchPilotCoreTests, 172 tests)
 ```
 
 `swift run` works for UI work because `main.swift` sets the `.accessory` activation policy itself. For a stable TCC identity use the bundled app from `scripts/build.sh`.
@@ -250,22 +248,28 @@ stateDiagram-v2
 
 **Transcription.** `IslandViewModel.captureStateDidChange` starts `WhisperTranscriber` when capture is `running` and stops it on `idle` or `failed`, so transcription runs exactly while capture runs. The transcriber is a `PCMBlockProcessor` fed by `AudioPipelineConsumer`; it downmixes blocks to mono and hands them to its own serial queue (`app.notchpilot.speech`), so the consumer never waits. That queue resamples to 16 kHz (`AudioResampler`) and keeps a rolling window (`WhisperWindowing`): each pass covers at most 15 s, and at most 30 s is held while a slow pass runs (the audio being transcribed plus the newest 15 s; older audio is dropped); whisper itself runs on a second serial queue (`app.notchpilot.speech.inference`) because one pass blocks for a few hundred milliseconds.
 
-whisper.cpp is a batch recogniser, so streaming is approximated: while speech continues, the whole current window is re-transcribed every step (1 s on Apple silicon, 2 s on Intel) and the result is shown as `partialText`. After 0.7 s of quiet following speech, or when the window reaches 15 s, the window is transcribed once more and that text is appended to `Transcript.finalText` (capped at about 20k characters); a fresh window starts. Only one pass runs at a time: if a pass takes longer than the step, the next one starts with the newest audio instead of queueing behind it. Partial passes skip whisper's temperature fallback (they are replaced a moment later anyway); final passes keep it. With Language set to Automatic, whisper detects the language once per utterance, on the first pass with at least 1 s of speech, and that language is used for the rest of the utterance, so later passes skip detection and the language doesn't flicker. Speech detection is an RMS threshold per 100 ms frame. A window with no speech is never handed to whisper (it invents text on silence), and output such as `[BLANK_AUDIO]`, `(music)`, other bracketed annotations, or "Thank you." over near-silence is dropped. Stop runs a last pass over a window that still holds speech and appends its text to the final text. whisper's abort callback asks a pass to stop early when its result is no longer wanted (stop, clear, model switch); it takes effect at whisper's next computation step, so GPU work already submitted finishes first. If the selected model file disappears (deleted in Settings), the next start frees the loaded model and reports `needsModel`. An audio sample rate the resampler can't convert ends transcription with a visible failure instead of silently dropping audio.
+whisper.cpp is a batch recogniser, so streaming is approximated: while speech continues, the whole current window is re-transcribed every step (1 s) and the result is shown as `partialText`. After 0.7 s of quiet following speech, or when the window reaches 15 s, the window is transcribed once more and that text is appended to `Transcript.finalText` (capped at about 20k characters); a fresh window starts. Only one pass runs at a time: if a pass takes longer than the step, the next one starts with the newest audio instead of queueing behind it. Partial passes skip whisper's temperature fallback (they are replaced a moment later anyway); final passes keep it. With Language set to Automatic, whisper detects the language once per utterance, on the first pass with at least 1 s of speech, and that language is used for the rest of the utterance, so later passes skip detection and the language doesn't flicker. Speech detection is an RMS threshold per 100 ms frame. A window with no speech is never handed to whisper (it invents text on silence), and output such as `[BLANK_AUDIO]`, `(music)`, other bracketed annotations, or "Thank you." over near-silence is dropped. Stop runs a last pass over a window that still holds speech and appends its text to the final text. whisper's abort callback asks a pass to stop early when its result is no longer wanted (stop, clear, model switch); it takes effect at whisper's next computation step, so GPU work already submitted finishes first. If the selected model file disappears (deleted in Settings), the next start frees the loaded model and reports `needsModel`. An audio sample rate the resampler can't convert ends transcription with a visible failure instead of silently dropping audio.
 
-States: no downloaded model → `needsModel` (the island offers Settings › Speech); `loadingModel` while the file loads (Metal on Apple silicon, CPU on Intel); `unavailable` if whisper rejects the file; then `listening`. Audio is held only in that in-memory window and never written to disk. The transcript is in memory only; **Clear Transcript** in the status menu empties it (`IslandViewModel.clearTranscript()`).
+States: no downloaded model → `needsModel` (the island offers Settings › Speech); `loadingModel` while the file loads onto the GPU (Metal, flash attention); `unavailable` if whisper rejects the file; then `listening`. Audio is held only in that in-memory window and never written to disk. The transcript is in memory only; **Clear Transcript** in the status menu empties it (`IslandViewModel.clearTranscript()`).
 
 **Speech models.** Multilingual ggml models from [huggingface.co/ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) (downloads redirect to its CDN, *.hf.co), listed in `SpeechModel.catalog`. Download URLs are pinned to one commit of that repository (`5359861c739e955e79d9a303bcbc70fb988958b1`):
 
-| Model | File | Size | Notes |
-|---|---|---|---|
-| Tiny | `ggml-tiny.bin` | 78 MB | Fastest. Default on Intel Macs |
-| Base | `ggml-base.bin` | 148 MB | Default on Apple silicon |
-| Small | `ggml-small.bin` | 488 MB | More accurate; Apple silicon |
-| Large Turbo | `ggml-large-v3-turbo-q5_0.bin` | 574 MB | Most accurate; M-series with 16 GB |
+| Model | File | Download | App memory while transcribing | Notes |
+|---|---|---|---|---|
+| Tiny | `ggml-tiny.bin` | 78 MB | ~250 MB | Fastest, least accurate |
+| Base | `ggml-base.bin` | 148 MB | ~350 MB | **Default.** Real-time on every Apple silicon Mac |
+| Small | `ggml-small.bin` | 488 MB | ~800 MB | More accurate, slower to update |
+| Large Turbo | `ggml-large-v3-turbo-q5_0.bin` | 574 MB | ~800 MB | Most accurate, slowest; labelled "best with 16 GB memory" on 8 GB Macs |
 
 `SpeechModelStore` downloads a model only when you click Download in Settings › Speech, verifies its size and SHA-256 against the values pinned in the catalog (a mismatch deletes the file and shows an error), and moves it into place atomically. Files live in `~/Library/Application Support/NotchPilot/Models` (excluded from Time Machine). Delete a model in Settings › Speech, or remove the file from that folder.
 
-**Intel Macs.** There is no GPU path on Intel; whisper runs on up to four CPU threads. Expect Tiny to keep up with a 2 s update interval, with partial text lagging speech by a few seconds; larger models may fall well behind real time. These are expectations, not measurements: NotchPilot has not been run on an Intel Mac.
+**Memory (8 GB Macs).** NotchPilot is built to share an 8 GB Mac with other apps. The figures above (the same ones Settings › Speech shows) are the whole process footprint (`phys_footprint`, what Activity Monitor's Memory column shows) of a fresh process with the model loaded and transcribing, rounded up; about 120 MB of each is whisper's Metal setup, shared by every model. They were measured on Apple silicon by the opt-in test `memoryBudgetAndIdleUnload` (`NOTCHPILOT_WHISPER_INTEGRATION=1 NOTCHPILOT_WHISPER_MODEL=base swift test --filter memoryBudgetAndIdleUnload`). Loading peaks briefly higher (about 0.45 GB for Base, 1.2–1.3 GB for Small and Large Turbo) because the verified file and whisper's copy coexist for a moment. The model is the only large allocation, and it is loaded only when needed:
+- It loads when capture starts and stays loaded while capturing.
+- It is freed 60 s after capture stops (starting again within that minute reuses it; later, reloading Base takes about a second).
+- It is freed at once if memory pressure rises while capture is off, and right at stop (instead of after 60 s) if pressure is already elevated then. During capture it is kept even under pressure, so the transcript keeps working.
+- With no model loaded, the app uses about 130 MB, most of it whisper's Metal setup, which stays until quit.
+
+The model file is read into private anonymous memory that is unmapped right after loading, and SHA-256 hashing reads in 1 MiB chunks, so neither the check nor a download holds a file-sized buffer afterwards. These were measured on a 10-core Apple silicon Mac, not on an 8 GB M1 Air; absolute numbers there should be close (the footprint depends on the model, not the chip), and speed will be lower.
 **Ask.** The expanded island has a question `TextField`, an **Include Screen** toggle and an **Ask** button (Return in the field also asks; an empty field asks the model to respond to the transcript). The global **Ask shortcut** (default ⇧⌘Space, `HotKey.defaultAsk`; changeable in Settings › General) opens the island from any app with the question field focused, so the flow is: shortcut, type (or don't), Return. `IslandViewModel.ask()` is the only path that sends user data:
 
 1. If there is neither transcript text nor a question, it fails with `nothingToSend` before anything is captured.
@@ -526,9 +530,9 @@ Not part of `NotchPilotConfig`: these are runtime preferences edited in the [Set
 - The interactive capture and permission (TCC) flow needs a human on a Mac; it is not covered by automated tests.
 - With ad-hoc signing the code identity changes on every rebuild, so macOS may ask for permission again.
 - ScreenCaptureKit requires a display content filter to deliver system audio, so a 2x2 px, at most 1 fps video stream exists. NotchPilot registers no screen output and discards that video.
-- Real calls to the Anthropic and OpenAI APIs, TCC prompts (Screen & System Audio Recording), Keychain prompts with ad-hoc signing, and transcription accuracy per language are not verified by automated tests. The tests cover 167 Swift tests plus the C++ suite under TSan and ASan/UBSan.
+- Real calls to the Anthropic and OpenAI APIs, TCC prompts (Screen & System Audio Recording), Keychain prompts with ad-hoc signing, and transcription accuracy per language are not verified by automated tests. The tests cover 172 Swift tests plus the C++ suite under TSan and ASan/UBSan.
 - whisper.cpp output for real audio is checked by one opt-in test (`NOTCHPILOT_WHISPER_INTEGRATION=1 swift test --filter WhisperIntegrationTests` downloads Tiny and transcribes speech made with `say`); it is skipped by default.
-- Transcription has not been run on an Intel Mac; Intel performance in this README is an expectation.
+- Transcription has not been run on an 8 GB M1 Mac; memory figures were measured on a 10-core Apple silicon Mac.
 - Streaming is approximate: partial text can change as more of the utterance arrives, and a 15 s window can cut a word.
 - OpenAI has no default-model guarantee: if your account lacks `gpt-5`, set another model in Settings.
 - No resampling: audio whose sample rate differs from `audio.sampleRate` is rejected and capture stops.

@@ -75,28 +75,55 @@ public final class WhisperTranscriber: SystemAudioTranscribing, @unchecked Senda
     /// Set while the stop() pass still owns the partial text on screen; a new session
     /// that starts first clears it, and the pass then leaves `partialText` alone.
     private var stopPassOwningPartial: InferenceCancellation?
+    /// Incremented by every start and stop, so only the latest stop's idle unload runs.
+    private var idleUnloadToken = 0
+    /// True while macOS reports warning or critical memory pressure (updated on `queue`).
+    private var memoryPressureElevated = false
 
     // Inference-queue-confined state.
     private var context: WhisperContext?
+
+    /// Tracks memory pressure (warning, critical and back to normal); its handler runs on
+    /// `queue`. Immutable after `init`, cancelled in `deinit`.
+    private let memoryPressureSource: any DispatchSourceMemoryPressure
+
+    // Memory budget (8 GB Macs with other apps open): the loaded model is the only large
+    // allocation. It stays loaded while capturing, is freed `idleUnloadDelay` after capture
+    // stops (starting again reloads it in about a second), and is freed at once on a memory
+    // pressure warning while not capturing. While capturing it is kept: freeing it would
+    // stop the transcript the person asked for.
+
+    /// How long a model stays loaded after capture stops.
+    static let defaultIdleUnloadDelay: Duration = .seconds(60)
+    private let idleUnloadDelay: Duration
 
     public convenience init(modelStore: any SpeechModelManaging) {
         self.init(modelStore: modelStore, windowConfiguration: .default)
     }
 
-    /// Injection point for tests (shorter steps, different thresholds).
-    init(modelStore: any SpeechModelManaging, windowConfiguration: WhisperWindowing.Configuration) {
+    /// Injection point for tests (shorter steps, different thresholds, a short idle delay).
+    init(modelStore: any SpeechModelManaging, windowConfiguration: WhisperWindowing.Configuration,
+         idleUnloadDelay: Duration = WhisperTranscriber.defaultIdleUnloadDelay) {
         self.modelStore = modelStore
         self.windowConfiguration = windowConfiguration
+        self.idleUnloadDelay = idleUnloadDelay
+        memoryPressureSource = DispatchSource.makeMemoryPressureSource(eventMask: [.normal, .warning, .critical], queue: queue)
         windowing = WhisperWindowing(configuration: windowConfiguration)
         (states, statesContinuation) = AsyncStream.makeStream(bufferingPolicy: .bufferingNewest(1))
         (transcripts, transcriptsContinuation) = AsyncStream.makeStream(bufferingPolicy: .bufferingNewest(1))
         statesContinuation.yield(.off)
         transcriptsContinuation.yield(Transcript())
+        memoryPressureSource.setEventHandler { [weak self] in
+            guard let self else { return }
+            memoryPressureDidChange(memoryPressureSource.data)
+        }
+        memoryPressureSource.activate()
     }
 
     deinit {
         // Pending work captures `self` strongly, so nothing is running here; the context
         // (if any) is freed with this object.
+        memoryPressureSource.cancel()
         statesContinuation.finish()
         transcriptsContinuation.finish()
     }
@@ -107,6 +134,7 @@ public final class WhisperTranscriber: SystemAudioTranscribing, @unchecked Senda
     /// listening or loading is a no-op.
     public func start(model: SpeechModel, language: String) {
         queue.async { [self] in
+            idleUnloadToken += 1   // cancels a pending idle unload
             guard let fileURL = modelStore.installedFileURL(for: model) else {
                 endSession()
                 releasePartial()
@@ -177,6 +205,7 @@ public final class WhisperTranscriber: SystemAudioTranscribing, @unchecked Senda
             let language = utteranceLanguage.effective
             endSession()
             setState(.off)
+            scheduleIdleUnload()
             guard let pending else { return commitPartial() }
             runFinalPass(pending, language: language, speechSeconds: speechSeconds)
         }
@@ -252,7 +281,8 @@ public final class WhisperTranscriber: SystemAudioTranscribing, @unchecked Senda
                 // Not retried per block: the state leaves `.listening`, so later blocks are ignored.
                 endSession()
                 commitPartial()
-                return setState(.failed("Unsupported audio format (\(Int(sampleRate)) Hz)."))
+                setState(.failed("Unsupported audio format (\(Int(sampleRate)) Hz)."))
+                return scheduleIdleUnload()
             }
             resampler = made
         }
@@ -348,6 +378,34 @@ public final class WhisperTranscriber: SystemAudioTranscribing, @unchecked Senda
             transcript.partialText = ""
             transcriptsContinuation.yield(transcript)
         }
+    }
+
+    /// Frees the model `idleUnloadDelay` from now unless listening starts again first, or at
+    /// once if memory pressure is already elevated (no new pressure event would arrive to
+    /// do it). The unload is queued behind the stop pass on the inference queue, so that
+    /// pass finishes.
+    private func scheduleIdleUnload() {
+        dispatchPrecondition(condition: .onQueue(queue))
+        idleUnloadToken += 1
+        if memoryPressureElevated { return unloadModel() }
+        let token = idleUnloadToken
+        let delay = idleUnloadDelay.components
+        let nanoseconds = Int(delay.seconds) * 1_000_000_000 + Int(delay.attoseconds / 1_000_000_000)
+        queue.asyncAfter(deadline: .now() + .nanoseconds(nanoseconds)) { [weak self] in
+            guard let self, token == idleUnloadToken, session == nil else { return }
+            unloadModel()
+        }
+    }
+
+    /// Records the pressure level; on warning or critical, frees the model unless it is in
+    /// use right now. During a session it is kept even at critical: freeing it would stop the
+    /// transcript the person asked for (macOS compresses or swaps instead).
+    private func memoryPressureDidChange(_ event: DispatchSource.MemoryPressureEvent) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        memoryPressureElevated = !event.isDisjoint(with: [.warning, .critical])
+        guard memoryPressureElevated, session == nil,
+              loadedModelID != nil || pendingLoadModelID != nil else { return }
+        unloadModel()
     }
 
     /// Frees the loaded model (after any pass already queued) and voids pending loads.

@@ -97,3 +97,28 @@ struct TranscriptTests {
         #expect(transcript.recentText(limit: 11) == "three four")
     }
 }
+
+@Suite("Speech model catalog")
+struct SpeechModelCatalogTests {
+    @Test("The recommended model is in the catalog and fits every Apple silicon Mac")
+    func recommended() throws {
+        let model = try #require(SpeechModel.named(SpeechModel.recommendedID))
+        #expect(model.id == "base")
+        #expect(model.recommendedMemoryGB == nil)
+        #expect(model.fitsThisMac)
+    }
+
+    @Test("Only Large Turbo states a memory recommendation")
+    func memoryRequirements() {
+        let requiring = SpeechModel.catalog.filter { $0.recommendedMemoryGB != nil }.map(\.id)
+        #expect(requiring == ["large-v3-turbo"])
+    }
+
+    @Test("Download URLs are pinned to a Hugging Face commit, not a branch")
+    func pinnedURLs() {
+        for model in SpeechModel.catalog {
+            #expect(!model.downloadURL.absoluteString.contains("/resolve/main/"))
+            #expect(model.downloadURL.lastPathComponent == model.fileName)
+        }
+    }
+}
