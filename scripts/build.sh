@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build NotchPilot and assemble a signed build/NotchPilot.app bundle.
 #
-# Usage: scripts/build.sh [--debug] [--run] [--help]
+# Usage: scripts/build.sh [--debug] [--install] [--run] [--help]
 # Env:   CODESIGN_IDENTITY  signing identity (default "-" = ad-hoc)
 #
 # The app is not sandboxed and ScreenCaptureKit needs no entitlement (the permission is
@@ -16,13 +16,15 @@ set -euo pipefail
 
 CONFIG=release
 RUN=0
+INSTALL=0
 
 usage() {
     cat <<USAGE
-Usage: scripts/build.sh [--debug] [--run] [--help]
+Usage: scripts/build.sh [--debug] [--install] [--run] [--help]
 
   --debug   build the debug configuration instead of release
-  --run     open the app after building
+  --install copy the app to /Applications (quits a running copy first)
+  --run     open the app after building (the installed copy with --install)
   --help    show this message
 
 Builds an Apple silicon (arm64) app that runs on any M-series Mac with macOS 14+.
@@ -36,6 +38,7 @@ for arg in "$@"; do
     case "$arg" in
         --debug) CONFIG=debug ;;
         --run) RUN=1 ;;
+        --install) INSTALL=1 ;;
         --help|-h) usage; exit 0 ;;
         *) echo "error: unknown option '$arg'" >&2; usage >&2; exit 2 ;;
     esac
@@ -82,6 +85,18 @@ plutil -lint "$APP/Contents/Info.plist"
 
 lipo "$APP/Contents/MacOS/NotchPilot" -verify_arch arm64 || die "executable is not arm64"
 
+# Self-contained: everything the app loads is either compiled in (whisper.cpp and its Metal
+# shaders) or part of macOS. SwiftPM still records the build machine's Xcode toolchain as a
+# runtime search path; nothing is loaded from it (all Swift libraries resolve to
+# /usr/lib/swift), but it names a path that only exists on the developer's Mac, so drop it.
+EXE="$APP/Contents/MacOS/NotchPilot"
+while read -r rpath; do
+    install_name_tool -delete_rpath "$rpath" "$EXE"
+done < <(otool -l "$EXE" | awk '/LC_RPATH/ { getline; getline; print $2 }' | grep -v -E '^(/usr/lib/swift|@loader_path|@executable_path)' || true)
+if otool -L "$EXE" | tail -n +2 | grep -v -E '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
+    die "the executable links a library outside macOS; the app would not be self-contained"
+fi
+
 echo "==> codesign (identity: $IDENTITY)"
 # A real identity gets a secure timestamp (needed for notarization and for the signature
 # to outlive the certificate); ad-hoc signatures can't be timestamped.
@@ -97,6 +112,22 @@ echo "App built: $APP ($(lipo -archs "$APP/Contents/MacOS/NotchPilot"))"
 if [[ "$IDENTITY" == "-" ]]; then
     echo "Note: ad-hoc signatures change on every rebuild, so macOS will ask for"
     echo "      Screen & System Audio Recording permission again after each rebuild."
+fi
+
+if (( INSTALL )); then
+    TARGET=/Applications/NotchPilot.app
+    echo "==> installing $TARGET"
+    if pgrep -x NotchPilot >/dev/null; then
+        osascript -e 'quit app "NotchPilot"' >/dev/null 2>&1 || true
+        # Quitting stops capture first (up to ~2 s); opening during that window fails.
+        for _ in $(seq 1 50); do pgrep -x NotchPilot >/dev/null || break; sleep 0.1; done
+        pgrep -x NotchPilot >/dev/null && die "NotchPilot is still running; quit it and run again"
+    fi
+    rm -rf "$TARGET"
+    ditto "$APP" "$TARGET"
+    codesign --verify --strict --deep "$TARGET"
+    echo "Installed: $TARGET"
+    APP="$TARGET"
 fi
 
 if (( RUN )); then
