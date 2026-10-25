@@ -44,6 +44,8 @@ Scripts (`scripts/`):
 scripts/build.sh            # release build (arm64), assembles and signs NotchPilot.app
 scripts/build.sh --debug    # debug build (enables the C++ ownership asserts)
 scripts/build.sh --run      # build, then launch the app
+scripts/build.sh --install  # build, then copy to /Applications
+scripts/build.sh --dmg      # build, then package build/NotchPilot.dmg for another Mac
 scripts/build-whisper.sh     # build Vendor/whisper.xcframework from pinned source (build.sh/test.sh run it when missing)
 scripts/build.sh --help
 scripts/test.sh             # swift test (229 Swift tests) + C++ tests under TSan and ASan/UBSan
@@ -62,13 +64,13 @@ CODESIGN_IDENTITY="Apple Development: Your Name (TEAMID)" scripts/build.sh --run
 
 ### Giving the app to someone else
 
-Build with `scripts/build.sh`. The app is arm64 (`lipo -archs build/NotchPilot.app/Contents/MacOS/NotchPilot` prints `arm64`) and runs on any Apple silicon Mac (M1 or later) with macOS 14 or later; Intel Macs can't open it. Zip it (`ditto -c -k --keepParent build/NotchPilot.app NotchPilot.zip`) and send it.
+The app is arm64 (`lipo -archs build/NotchPilot.app/Contents/MacOS/NotchPilot` prints `arm64`) and runs on any Apple silicon Mac (M1 or later) with macOS 14 or later; Intel Macs can't open it. Build with `scripts/build.sh --dmg` and send `build/NotchPilot.dmg` (about 3 MB). It holds the app, an Applications shortcut to drag it onto, and `Read Me First.txt` with the steps below. A zip works too (`ditto -c -k --keepParent build/NotchPilot.app NotchPilot.zip`).
 
 The ad-hoc signed app is not notarized, so on the other Mac Gatekeeper blocks the first launch:
 
-1. Unzip, move NotchPilot to Applications and double-click it. macOS says it can't verify the app; click **Done** (not Move to Trash).
+1. Open the DMG (or unzip), drag NotchPilot to Applications and double-click it there. macOS says it can't verify the app; click **Done** (not Move to Trash).
 2. Open System Settings > Privacy & Security, scroll to Security, and click **Open Anyway** next to the NotchPilot message. Confirm with your password, then **Open**.
-3. From then on it opens normally. Settings › Speech downloads the recommended speech model on first use.
+3. From then on it opens normally. The setup guide opens on first launch and walks through the permission, the speech model download and the API key.
 
 Raw SwiftPM equivalents:
 

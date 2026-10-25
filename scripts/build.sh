@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build NotchPilot and assemble a signed build/NotchPilot.app bundle.
 #
-# Usage: scripts/build.sh [--debug] [--install] [--run] [--help]
+# Usage: scripts/build.sh [--debug] [--install] [--dmg] [--run] [--help]
 # Env:   CODESIGN_IDENTITY  signing identity (default "-" = ad-hoc)
 #
 # The app is not sandboxed and ScreenCaptureKit needs no entitlement (the permission is
@@ -17,13 +17,15 @@ set -euo pipefail
 CONFIG=release
 RUN=0
 INSTALL=0
+DMG=0
 
 usage() {
     cat <<USAGE
-Usage: scripts/build.sh [--debug] [--install] [--run] [--help]
+Usage: scripts/build.sh [--debug] [--install] [--dmg] [--run] [--help]
 
   --debug   build the debug configuration instead of release
   --install copy the app to /Applications (quits a running copy first)
+  --dmg     also package build/NotchPilot.dmg to send to another Mac
   --run     open the app after building (the installed copy with --install)
   --help    show this message
 
@@ -39,6 +41,7 @@ for arg in "$@"; do
         --debug) CONFIG=debug ;;
         --run) RUN=1 ;;
         --install) INSTALL=1 ;;
+        --dmg) DMG=1 ;;
         --help|-h) usage; exit 0 ;;
         *) echo "error: unknown option '$arg'" >&2; usage >&2; exit 2 ;;
     esac
@@ -112,6 +115,36 @@ echo "App built: $APP ($(lipo -archs "$APP/Contents/MacOS/NotchPilot"))"
 if [[ "$IDENTITY" == "-" ]]; then
     echo "Note: ad-hoc signatures change on every rebuild, so macOS will ask for"
     echo "      Screen & System Audio Recording permission again after each rebuild."
+fi
+
+if (( DMG )); then
+    need hdiutil "hdiutil ships with macOS; this script must run on macOS"
+    DMG_PATH="$ROOT/build/NotchPilot.dmg"
+    STAGE="$ROOT/build/dmg"
+    echo "==> packaging $DMG_PATH"
+    rm -rf "$STAGE" "$DMG_PATH"
+    mkdir -p "$STAGE"
+    ditto "$APP" "$STAGE/NotchPilot.app"
+    ln -s /Applications "$STAGE/Applications"
+    # Ad-hoc signed and not notarized, so Gatekeeper blocks the first open of a downloaded copy.
+    cat > "$STAGE/Read Me First.txt" <<'README'
+NotchPilot: how to install
+
+1. Drag NotchPilot onto the Applications folder.
+2. Open NotchPilot from Applications. macOS says it can't check it for malicious
+   software, because the app isn't notarized by Apple. Click Done (not Move to Trash).
+3. Open System Settings > Privacy & Security, scroll down to Security and click
+   Open Anyway next to the NotchPilot message. Confirm with your password, then Open.
+4. From then on it opens normally. The setup guide walks you through the rest:
+   allowing Screen & System Audio Recording, downloading the speech model and
+   adding your API key.
+
+Needs a Mac with Apple silicon (M1 or later) and macOS 14 or later.
+README
+    hdiutil create -quiet -volname NotchPilot -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG_PATH"
+    rm -rf "$STAGE"
+    hdiutil verify -quiet "$DMG_PATH"
+    echo "DMG: $DMG_PATH ($(du -h "$DMG_PATH" | cut -f1))"
 fi
 
 if (( INSTALL )); then
