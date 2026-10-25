@@ -2,7 +2,8 @@
 # Build NotchPilot and assemble a signed build/NotchPilot.app bundle.
 #
 # Usage: scripts/build.sh [--debug] [--install] [--dmg] [--run] [--help]
-# Env:   CODESIGN_IDENTITY  signing identity (default "-" = ad-hoc)
+# Env:   CODESIGN_IDENTITY  signing identity (default: the first valid Developer ID Application
+#        or Apple Development identity in the keychain, else "-" = ad-hoc)
 #
 # The app is not sandboxed and ScreenCaptureKit needs no entitlement (the permission is
 # a runtime TCC grant, not a capability).
@@ -32,7 +33,8 @@ Usage: scripts/build.sh [--debug] [--install] [--dmg] [--run] [--help]
 Builds an Apple silicon (arm64) app that runs on any M-series Mac with macOS 14+.
 
 Environment:
-  CODESIGN_IDENTITY  signing identity (default: "-", ad-hoc)
+  CODESIGN_IDENTITY  signing identity (default: a valid Developer ID Application or
+                     Apple Development identity from the keychain, else "-", ad-hoc)
 USAGE
 }
 
@@ -67,7 +69,19 @@ swift_major=$(printf '%s\n' "$swift_version_line" | sed -nE 's/.*Swift version (
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 APP="$ROOT/build/NotchPilot.app"
-IDENTITY=${CODESIGN_IDENTITY:--}
+# A certificate identity keeps the app's designated requirement stable across rebuilds, so
+# macOS keeps the Screen & System Audio Recording grant; an ad-hoc signature is pinned to
+# one build's cdhash and the grant silently stops matching after every rebuild.
+default_identity() {
+    local kind
+    for kind in "Developer ID Application" "Apple Development"; do
+        security find-identity -v -p codesigning 2>/dev/null \
+            | awk -v kind="$kind" -F'"' 'index($2, kind ":") == 1 { print $2; exit }' \
+            | grep . && return
+    done
+    echo -
+}
+IDENTITY=${CODESIGN_IDENTITY:-$(default_identity)}
 
 "$ROOT/scripts/build-whisper.sh"
 

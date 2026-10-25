@@ -52,7 +52,7 @@ scripts/test.sh             # swift test (229 Swift tests) + C++ tests under TSa
 scripts/test.sh --cpp-only  # C++ tests only
 ```
 
-`scripts/build.sh` signs ad hoc by default. Set `CODESIGN_IDENTITY` to a stable identity (see [Troubleshooting](#troubleshooting)):
+`scripts/build.sh` signs with the first valid **Developer ID Application** or **Apple Development** identity in your keychain (`security find-identity -v -p codesigning`), and ad hoc only when there is none. A certificate identity keeps the app's designated requirement the same across rebuilds, so macOS keeps the Screen & System Audio Recording grant; an ad-hoc signature is pinned to one build's hash, and after a rebuild the switch in System Settings stays on but no longer matches (fix: `tccutil reset ScreenCapture app.notchpilot.NotchPilot`, then allow again). To choose the identity yourself, set `CODESIGN_IDENTITY` (`-` forces ad hoc):
 
 ```sh
 CODESIGN_IDENTITY="Apple Development: Your Name (TEAMID)" scripts/build.sh --run
@@ -66,7 +66,7 @@ CODESIGN_IDENTITY="Apple Development: Your Name (TEAMID)" scripts/build.sh --run
 
 The app is arm64 (`lipo -archs build/NotchPilot.app/Contents/MacOS/NotchPilot` prints `arm64`) and runs on any Apple silicon Mac (M1 or later) with macOS 14 or later; Intel Macs can't open it. Build with `scripts/build.sh --dmg` and send `build/NotchPilot.dmg` (about 3 MB). It holds the app, an Applications shortcut to drag it onto, and `Read Me First.txt` with the steps below. A zip works too (`ditto -c -k --keepParent build/NotchPilot.app NotchPilot.zip`).
 
-The ad-hoc signed app is not notarized, so on the other Mac Gatekeeper blocks the first launch:
+The app is not notarized (an Apple Development or ad-hoc signature isn't enough for Gatekeeper), so on the other Mac Gatekeeper blocks the first launch:
 
 1. Open the DMG (or unzip), drag NotchPilot to Applications and double-click it there. macOS says it can't verify the app; click **Done** (not Move to Trash).
 2. Open System Settings > Privacy & Security, scroll to Security, and click **Open Anyway** next to the NotchPilot message. Confirm with your password, then **Open**.
@@ -565,7 +565,7 @@ Not part of `NotchPilotConfig`: these are runtime preferences edited in the [Set
 ## Known limitations
 
 - The interactive capture and permission (TCC) flow needs a human on a Mac; it is not covered by automated tests.
-- With ad-hoc signing the code identity changes on every rebuild, so macOS may ask for permission again.
+- With ad-hoc signing (no certificate in the keychain) the code identity changes on every rebuild, so macOS may ask for permission again.
 - ScreenCaptureKit requires a display content filter to deliver system audio, so a 2x2 px, at most 1 fps video stream exists. NotchPilot registers no screen output and discards that video.
 - Real calls to the Anthropic and OpenAI APIs, TCC prompts (Screen & System Audio Recording), Keychain prompts with ad-hoc signing, and transcription accuracy per language are not verified by automated tests. The tests cover 229 Swift tests plus the C++ suite under TSan and ASan/UBSan.
 - whisper.cpp output for real audio is checked by one opt-in test (`NOTCHPILOT_WHISPER_INTEGRATION=1 swift test --filter WhisperIntegrationTests` downloads Tiny and transcribes speech made with `say`); it is skipped by default.
