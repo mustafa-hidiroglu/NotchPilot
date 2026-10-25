@@ -27,13 +27,16 @@ enum SettingsPane: String, CaseIterable {
     }
 }
 
-/// Settings › General: the Ask shortcut and the Include Screen default.
+/// Settings › General: open at login, the Ask shortcut and the Include Screen default.
 struct GeneralSettingsPane: View {
     @Bindable var store: AssistantSettingsStore
     let hotKeys: HotKeyCenter
+    let loginItem: LoginItemController
 
     var body: some View {
         Form {
+            LoginItemSection(loginItem: loginItem)   // Open at login (Setup/LoginItem.swift)
+
             Section {
                 Toggle(isOn: $store.settings.askHotKeyEnabled) {
                     Text("Ask from any app")
@@ -52,6 +55,17 @@ struct GeneralSettingsPane: View {
                     Button("Restore Default") { store.settings.askHotKey = .defaultAsk }
                         .disabled(store.settings.askHotKey == .defaultAsk || !store.settings.askHotKeyEnabled)
                 }
+                // One press / two presses (lane-island): the mode the shortcut opens.
+                Picker("One press opens", selection: $store.settings.askHotKeySinglePress) {
+                    Text(AskMode.once.settingsName).tag(AskMode.once)
+                    Text(AskMode.chat.settingsName).tag(AskMode.chat)
+                }
+                .disabled(!store.settings.askHotKeyEnabled)
+                Toggle(isOn: $store.settings.askHotKeyDoublePress) {
+                    Text("Press twice quickly for \(store.settings.askHotKeySinglePress.other.settingsName)")
+                    Text("A second press right after the first switches the island to \(store.settings.askHotKeySinglePress.other.settingsName). Uses your double-click speed from System Settings.")
+                }
+                .disabled(!store.settings.askHotKeyEnabled)
             } header: {
                 Text("Keyboard Shortcut")
             }
@@ -64,6 +78,16 @@ struct GeneralSettingsPane: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: SettingsPane.width, height: 330)
+        .frame(width: SettingsPane.width, height: 470)
+    }
+}
+
+extension AskMode {
+    /// As the island's mode control names it.
+    var settingsName: String {
+        switch self {
+        case .once: "Ask Once"
+        case .chat: "Chat"
+        }
     }
 }

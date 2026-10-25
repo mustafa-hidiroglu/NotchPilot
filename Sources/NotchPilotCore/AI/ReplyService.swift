@@ -21,11 +21,19 @@ public struct ReplyService: Sendable {
     }
 
     /// Validates the Ask synchronously (throws `.nothingToSend` or `.missingAPIKey` before any
-    /// network use), then streams the reply from the selected provider.
+    /// network use), then streams the reply from the selected provider. An answer needs a
+    /// transcript or a question; a summary needs a transcript. History is repaired and capped
+    /// here (the one place it is trimmed), within what the transcript and question leave of
+    /// `ChatHistory.maxCharacters`.
     public func streamReply(to request: ReplyRequest, settings: AssistantSettings) throws -> AsyncThrowingStream<ReplyEvent, Error> {
         let hasTranscript = !request.transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let hasQuestion = !(request.question?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-        guard hasTranscript || hasQuestion else { throw AssistantError.nothingToSend }
+        switch request.purpose {
+        case .answer: guard hasTranscript || hasQuestion else { throw AssistantError.nothingToSend }
+        case .summary: guard hasTranscript else { throw AssistantError.nothingToSend }
+        }
+        var request = request
+        request.history = ChatHistory.trimmed(request.history, characterBudget: ChatHistory.characterBudget(for: request))
 
         let provider = settings.provider
         guard let apiKey = try keyStore.apiKey(for: provider)?.trimmingCharacters(in: .whitespacesAndNewlines),

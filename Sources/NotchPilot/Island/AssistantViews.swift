@@ -240,7 +240,7 @@ struct AskRow: View {
     var body: some View {
         HStack(spacing: 8) {
             TextField("Question", text: $model.question,
-                      prompt: Text("Ask about what’s playing…").foregroundStyle(placeholder))
+                      prompt: Text(prompt).foregroundStyle(placeholder))
                 .textFieldStyle(.plain)
                 .font(.system(size: 13))
                 .foregroundStyle(IslandPalette.primary)
@@ -258,7 +258,9 @@ struct AskRow: View {
                 .onSubmit(model.ask)
                 .onExitCommand { model.setPresentation(.compact) }
                 .accessibilityLabel("Question")
-                .accessibilityHint("Optional. Press Return to ask \(model.provider.displayName).")
+                .accessibilityHint(model.askMode == .chat
+                                   ? "Optional. Press Return to ask \(model.provider.displayName). Earlier turns of this chat are included."
+                                   : "Optional. Press Return to ask \(model.provider.displayName).")
 
             Toggle("Include Screen", isOn: $model.includeScreen)
                 .toggleStyle(IslandChipToggleStyle(systemImage: "display"))
@@ -271,6 +273,10 @@ struct AskRow: View {
                 .help("Send the recent transcript\(model.includeScreen ? " and a screenshot" : "") to \(model.provider.displayName)")
                 .fixedSize()
         }
+    }
+
+    private var prompt: String {
+        model.askMode == .chat && !model.chat.isEmpty ? "Ask a follow-up…" : "Ask about what’s playing…"
     }
 
     /// Increase Contrast: same secondary step as the rest of the island.
@@ -311,8 +317,13 @@ struct AskOutput: View {
             case .waiting(let provider):
                 // Specific about what happens next (HIG › Generative AI: "Consider giving
                 // specific, reassuring feedback during generation").
-                progress("Waiting for \(provider.displayName)…",
-                         detail: "The reply appears here as \(provider.displayName) writes it.")
+                if model.askPurpose == .summary {
+                    progress("\(provider.displayName) is summarizing the transcript…",
+                             detail: "Key points, decisions and action items appear here as they’re written.")
+                } else {
+                    progress("Waiting for \(provider.displayName)…",
+                             detail: "The reply appears here as \(provider.displayName) writes it.")
+                }
             case .failed(let failure):
                 failureView(failure)
             case .streaming(let reply):
@@ -394,6 +405,8 @@ struct AskOutput: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 Text(replySource(reply, stoppedEarly: stoppedEarly))
+                    // VoiceOver reads commas, not the middle dot.
+                    .accessibilityLabel(replySource(reply, stoppedEarly: stoppedEarly).replacingOccurrences(of: " · ", with: ", "))
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(secondary)
                     .lineLimit(1)
@@ -415,7 +428,7 @@ struct AskOutput: View {
                     }
                     .buttonStyle(IslandSecondaryButtonStyle())
                     .focused($copyFocused)
-                    .accessibilityLabel(copied ? "Copied" : "Copy reply")
+                    .accessibilityHint("Copies this reply")
                     dismissButton
                 }
             }
@@ -426,7 +439,7 @@ struct AskOutput: View {
     }
 
     private func replySource(_ reply: AssistantReply, stoppedEarly: Bool) -> String {
-        var source = reply.provider.displayName
+        var source = model.askPurpose == .summary ? "Summary · \(reply.provider.displayName)" : reply.provider.displayName
         if !reply.model.isEmpty { source += " · \(reply.model)" }
         if stoppedEarly { source += " · Stopped" }
         else if reply.truncated { source += " · Reply cut off at the length limit" }

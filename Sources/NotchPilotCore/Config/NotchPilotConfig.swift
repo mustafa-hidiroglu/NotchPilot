@@ -14,12 +14,21 @@ public struct NotchPilotConfig: Sendable, Equatable {
         /// Fallback compact height when a notched display reports no safe-area inset.
         public var minimumNotchHeight: CGFloat = 32
         /// Expanded content area, measured below the camera housing / top edge: capture
-        /// status, level bar, live transcript, Ask row and footer.
-        public var expandedContentSize = CGSize(width: 460, height: 208)
+        /// status, level bar, live transcript, mode row (Ask Once / Chat), Ask row and footer.
+        public var expandedContentSize = CGSize(width: 460, height: 236)
         /// Extra expanded height while an Ask is in progress or has failed (one-row notice).
         public var expandedNoticeHeight: CGFloat = 74
         /// Extra expanded height while a reply is shown (about five lines of text).
         public var expandedReplyHeight: CGFloat = 140
+        /// Extra expanded height in Chat mode, for the conversation (constant, so the island
+        /// doesn't change height turn by turn). About 520 pt in all below a notch, which fits
+        /// a 13-inch MacBook Air at its default 1440 × 900; on smaller screens the island is
+        /// clamped to the visible height and the conversation gets what is left.
+        public var expandedChatHeight: CGFloat = 248
+        /// Smallest conversation height worth showing in Chat. When a short screen clamps the
+        /// island below that, Chat hides the level bar and live transcript to make room
+        /// (`IslandGeometry.chatUsesCompactRows`).
+        public var minimumChatConversationHeight: CGFloat = 120
         /// Bottom corner radius in compact and expanded states.
         public var compactCornerRadius: CGFloat = 12
         public var expandedCornerRadius: CGFloat = 24

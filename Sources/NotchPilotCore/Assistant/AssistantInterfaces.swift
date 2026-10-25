@@ -55,6 +55,12 @@ public struct AssistantSettings: Codable, Sendable, Equatable {
     /// Global keyboard shortcut that opens the island ready to Ask.
     public var askHotKeyEnabled = true
     public var askHotKey = HotKey.defaultAsk
+    /// What one press of the Ask shortcut opens. A quick second press (when
+    /// `askHotKeyDoublePress` is on) switches the open island to the other mode.
+    public var askHotKeySinglePress = AskMode.once
+    public var askHotKeyDoublePress = true
+    /// Set once the person finishes or skips the first-run setup guide.
+    public var hasCompletedSetup = false
 
     public init() {}
 
@@ -64,6 +70,7 @@ public struct AssistantSettings: Codable, Sendable, Equatable {
         case provider, claudeModel, claudeEffort, openAIModel, systemPrompt
         case includeScreenshotByDefault, transcriptCharacterLimit
         case speechModelID, speechLanguage, askHotKeyEnabled, askHotKey
+        case askHotKeySinglePress, askHotKeyDoublePress, hasCompletedSetup
     }
 
     public init(from decoder: Decoder) throws {
@@ -84,7 +91,21 @@ public struct AssistantSettings: Codable, Sendable, Equatable {
         speechLanguage = (try? c.decodeIfPresent(String.self, forKey: .speechLanguage)) ?? speechLanguage
         askHotKeyEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .askHotKeyEnabled)) ?? askHotKeyEnabled
         askHotKey = (try? c.decodeIfPresent(HotKey.self, forKey: .askHotKey)) ?? askHotKey
+        if let raw = try? c.decodeIfPresent(String.self, forKey: .askHotKeySinglePress), let mode = AskMode(rawValue: raw) {
+            askHotKeySinglePress = mode
+        }
+        askHotKeyDoublePress = (try? c.decodeIfPresent(Bool.self, forKey: .askHotKeyDoublePress)) ?? askHotKeyDoublePress
+        hasCompletedSetup = (try? c.decodeIfPresent(Bool.self, forKey: .hasCompletedSetup)) ?? hasCompletedSetup
     }
+}
+
+/// How the island handles an Ask: one question and one reply, or a running conversation
+/// whose earlier turns are sent with each follow-up.
+public enum AskMode: String, Codable, Sendable, CaseIterable {
+    case once
+    case chat
+
+    public var other: AskMode { self == .once ? .chat : .once }
 }
 
 /// A global keyboard shortcut: a virtual key code plus Carbon modifier flags
@@ -105,6 +126,28 @@ public struct HotKey: Codable, Sendable, Equatable {
 
 // MARK: - Replies
 
+/// One earlier turn of a chat, text only (screenshots are sent only with the turn they
+/// were taken for).
+public struct ChatTurn: Sendable, Equatable, Identifiable {
+    public enum Role: String, Sendable { case user, assistant }
+    public let id: UUID
+    public var role: Role
+    public var text: String
+
+    public init(id: UUID = UUID(), role: Role, text: String) {
+        self.id = id
+        self.role = role
+        self.text = text
+    }
+}
+
+/// What an Ask is for. `.summary` ignores `question` and asks for key points, decisions
+/// and action items from the transcript.
+public enum AskPurpose: Sendable, Equatable {
+    case answer
+    case summary
+}
+
 public struct ReplyRequest: Sendable, Equatable {
     public var transcript: String
     /// Optional question typed by the person; nil means "respond to the transcript".
@@ -112,12 +155,20 @@ public struct ReplyRequest: Sendable, Equatable {
     /// JPEG bytes of one on-demand screenshot, or nil.
     public var screenshotJPEG: Data?
     public var systemPrompt: String
+    /// Earlier turns of a chat, oldest first, alternating user/assistant and starting with
+    /// a user turn; empty for a one-time Ask. The new turn (transcript + question, and the
+    /// screenshot if any) is sent after them.
+    public var history: [ChatTurn]
+    public var purpose: AskPurpose
 
-    public init(transcript: String, question: String? = nil, screenshotJPEG: Data? = nil, systemPrompt: String) {
+    public init(transcript: String, question: String? = nil, screenshotJPEG: Data? = nil, systemPrompt: String,
+                history: [ChatTurn] = [], purpose: AskPurpose = .answer) {
         self.transcript = transcript
         self.question = question
         self.screenshotJPEG = screenshotJPEG
         self.systemPrompt = systemPrompt
+        self.history = history
+        self.purpose = purpose
     }
 }
 

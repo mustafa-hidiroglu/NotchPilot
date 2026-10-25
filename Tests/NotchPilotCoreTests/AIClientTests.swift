@@ -105,10 +105,22 @@ private struct InMemoryKeyStore: APIKeyStoring {
     func removeAPIKey(for provider: AIProvider) throws {}
 }
 
+/// The last request a `RecordingClient` was asked to send.
+private final class RequestLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _last: ReplyRequest?
+    var last: ReplyRequest? {
+        get { lock.withLock { _last } }
+        set { lock.withLock { _last = newValue } }
+    }
+}
+
 private struct RecordingClient: ReplyGenerating {
     let provider: AIProvider
+    var log = RequestLog()
     func streamReply(to request: ReplyRequest, apiKey: String, settings: AssistantSettings) -> AsyncThrowingStream<ReplyEvent, Error> {
-        AsyncThrowingStream { continuation in
+        log.last = request
+        return AsyncThrowingStream { continuation in
             continuation.yield(.started(model: "stub"))
             continuation.yield(.textDelta("key=\(apiKey)"))
             continuation.yield(.finished(truncated: false))
@@ -539,6 +551,73 @@ struct AIClientTests {
         }
     }
 
+    // MARK: Chat history and summaries
+
+    private let history = [
+        ChatTurn(role: .user, text: "Who is presenting?"),
+        ChatTurn(role: .assistant, text: "Dana."),
+        ChatTurn(role: .user, text: "(Asked about the transcript at the time)"),
+        ChatTurn(role: .assistant, text: "They moved the launch."),
+    ]
+
+    @Test("Claude sends history as alternating text messages, then the new turn with screenshot and transcript")
+    func claudeHistory() async throws {
+        StubURLProtocol.respond(.init(status: 200, body: claudeOK))
+        let request = ReplyRequest(transcript: "launch is monday now", question: "When?", screenshotJPEG: jpeg,
+                                   systemPrompt: "SYS", history: history)
+        _ = try await ClaudeClient(session: stubSession()).reply(to: request, apiKey: "k", settings: AssistantSettings())
+
+        let body = try capturedJSON()
+        #expect(body["system"] as? String == "SYS")
+        let messages = try #require(body["messages"] as? [[String: Any]])
+        #expect(messages.map { $0["role"] as? String } == ["user", "assistant", "user", "assistant", "user"])
+        for (message, turn) in zip(messages, history) {
+            let content = try #require(message["content"] as? [[String: Any]])
+            #expect(content.count == 1)
+            #expect(content[0]["type"] as? String == "text")
+            #expect(content[0]["text"] as? String == turn.text)
+        }
+        let newest = try #require(messages[4]["content"] as? [[String: Any]])
+        #expect(newest.map { $0["type"] as? String } == ["image", "text"])
+        #expect(newest[1]["text"] as? String
+            == "Transcript of audio playing on my Mac (most recent last):\nlaunch is monday now\n\nMy question: When?")
+    }
+
+    @Test("OpenAI sends system, history with string assistant content, then the new turn with transcript and screenshot")
+    func openAIHistory() async throws {
+        StubURLProtocol.respond(.init(status: 200, body: openAIStream([["content": "Monday."]])))
+        let request = ReplyRequest(transcript: "launch is monday now", question: "When?", screenshotJPEG: jpeg,
+                                   systemPrompt: "SYS", history: history)
+        _ = try await OpenAIClient(session: stubSession()).reply(to: request, apiKey: "k", settings: AssistantSettings())
+
+        let messages = try #require(try capturedJSON()["messages"] as? [[String: Any]])
+        #expect(messages.map { $0["role"] as? String } == ["system", "user", "assistant", "user", "assistant", "user"])
+        #expect(messages[0]["content"] as? String == "SYS")
+        let userParts = try #require(messages[1]["content"] as? [[String: Any]])
+        #expect(userParts.count == 1)
+        #expect(userParts[0]["text"] as? String == "Who is presenting?")
+        #expect(messages[2]["content"] as? String == "Dana.")
+        #expect((messages[3]["content"] as? [[String: Any]])?.first?["text"] as? String == "(Asked about the transcript at the time)")
+        #expect(messages[4]["content"] as? String == "They moved the launch.")
+        let newest = try #require(messages[5]["content"] as? [[String: Any]])
+        #expect(newest.map { $0["type"] as? String } == ["text", "image_url"])
+        #expect(newest[0]["text"] as? String
+            == "Transcript of audio playing on my Mac (most recent last):\nlaunch is monday now\n\nMy question: When?")
+    }
+
+    @Test("A summary asks for gist, key points, decisions, action items and open questions, ignoring the question")
+    func summaryText() {
+        let text = ProviderHTTP.composedText(for: ReplyRequest(transcript: "we agreed to ship", question: "ignored",
+                                                               systemPrompt: "s", purpose: .summary))
+        #expect(text.hasPrefix("Transcript of audio playing on my Mac (most recent last):\nwe agreed to ship\n\nSummarize this transcript."))
+        for phrase in ["one-line gist", "key points as bullets", "decisions", "action items, with the owner when one is named",
+                       "open questions", "Leave out any part that would be empty", "Keep it short", "same language as the transcript"] {
+            #expect(text.contains(phrase), "missing: \(phrase)")
+        }
+        #expect(!text.contains("ignored"))
+        #expect(!text.contains("My question"))
+    }
+
     // MARK: ReplyService
 
     private func service(keys: [AIProvider: String]) -> ReplyService {
@@ -590,5 +669,44 @@ struct AIClientTests {
         let (events, error) = await drain(try service(keys: keys).streamReply(to: ReplyRequest(transcript: "t", systemPrompt: "s"), settings: settings))
         #expect(error == nil)
         #expect(events == [.started(model: "stub"), .textDelta("key=o-key"), .finished(truncated: false)])
+    }
+
+    @Test("A summary needs a transcript; an empty question is fine, a question alone is not enough")
+    func summaryValidation() async throws {
+        await #expect(throws: AssistantError.nothingToSend) {
+            try await service(keys: [.claude: "k"])
+                .reply(to: ReplyRequest(transcript: " \n", question: "Why?", systemPrompt: "s", purpose: .summary), settings: AssistantSettings())
+        }
+        let reply = try await service(keys: [.claude: "k"])
+            .reply(to: ReplyRequest(transcript: "we ship friday", systemPrompt: "s", purpose: .summary), settings: AssistantSettings())
+        #expect(reply.text == "key=k")
+    }
+
+    @Test("History is repaired and capped before it reaches the provider")
+    func serviceTrimsHistory() async throws {
+        let claude = RecordingClient(provider: .claude)
+        let service = ReplyService(keyStore: InMemoryKeyStore(keys: [.claude: "k"]), claude: claude, openAI: RecordingClient(provider: .openAI))
+        let orphan = ChatTurn(role: .assistant, text: "orphan")
+        let trailing = ChatTurn(role: .user, text: "unanswered")
+        let request = ReplyRequest(transcript: "t", systemPrompt: "s", history: [orphan] + history + [trailing])
+        _ = try await service.reply(to: request, settings: AssistantSettings())
+        #expect(claude.log.last?.history == history)
+        #expect(claude.log.last?.transcript == "t")
+    }
+
+    @Test("History is trimmed within what the transcript and question leave of the character cap")
+    func serviceBudgetsHistoryAgainstTranscript() async throws {
+        let claude = RecordingClient(provider: .claude)
+        let service = ReplyService(keyStore: InMemoryKeyStore(keys: [.claude: "k"]), claude: claude, openAI: RecordingClient(provider: .openAI))
+        let old = [ChatTurn(role: .user, text: "old"), ChatTurn(role: .assistant, text: String(repeating: "a", count: 10_000))]
+        let recent = [ChatTurn(role: .user, text: "new"), ChatTurn(role: .assistant, text: String(repeating: "b", count: 10_000))]
+        // 20 006 of history fits the 24 000 cap alone, but not next to a 6 000-character transcript.
+        let transcript = String(repeating: "t", count: 6_000)
+        _ = try await service.reply(to: ReplyRequest(transcript: transcript, question: "q", systemPrompt: "s", history: old + recent),
+                                    settings: AssistantSettings())
+        #expect(claude.log.last?.history == recent)
+
+        _ = try await service.reply(to: ReplyRequest(transcript: "short", systemPrompt: "s", history: old + recent), settings: AssistantSettings())
+        #expect(claude.log.last?.history == old + recent)
     }
 }

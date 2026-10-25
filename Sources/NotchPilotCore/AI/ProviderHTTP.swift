@@ -18,10 +18,18 @@ enum ProviderHTTP {
         return URLSession(configuration: configuration)
     }()
 
-    /// The user-turn text sent to either provider.
+    /// The new user turn's text sent to either provider. Chat follow-ups carry the latest
+    /// transcript too, so the model sees what was said since the previous turn.
     static func composedText(for request: ReplyRequest) -> String {
         var text = "Transcript of audio playing on my Mac (most recent last):\n\(request.transcript)"
-        if let question = request.question?.trimmingCharacters(in: .whitespacesAndNewlines), !question.isEmpty {
+        if request.purpose == .summary {
+            text += """
+                \n\nSummarize this transcript. Use these parts, in this order: a one-line gist; key \
+                points as bullets; decisions; action items, with the owner when one is named; open \
+                questions. Leave out any part that would be empty. Keep it short, and write in the \
+                same language as the transcript.
+                """
+        } else if let question = request.question?.trimmingCharacters(in: .whitespacesAndNewlines), !question.isEmpty {
             text += "\n\nMy question: \(question)"
         } else {
             text += "\n\nRespond helpfully to what's being said."

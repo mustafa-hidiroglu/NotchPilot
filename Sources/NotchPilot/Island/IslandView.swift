@@ -250,8 +250,8 @@ private struct MiniMeter: View {
     }
 }
 
-/// Expanded body: status, primary action, level meter, live transcript, Ask row, assistant
-/// output, telemetry and privacy note.
+/// Expanded body: status, primary action, level meter, live transcript, mode row, Ask row,
+/// assistant output (Ask Once) or conversation (Chat), telemetry and privacy note.
 private struct ExpandedContent: View {
     @Bindable var model: IslandViewModel
     @FocusState private var primaryFocused: Bool
@@ -281,9 +281,25 @@ private struct ExpandedContent: View {
                 primaryAction
             }
 
-            LevelBar(snapshot: model.level, active: isRunning)
+            // On a screen too short for the full Chat island, the level bar and transcript
+            // make way so the conversation and the question field still fit (the status row
+            // above still shows capture state).
+            if !(model.askMode == .chat && model.geometry.chatUsesCompactRows) {
+                LevelBar(snapshot: model.level, active: isRunning)
 
-            TranscriptRow(model: model)
+                TranscriptRow(model: model)
+            }
+
+            ModeRow(model: model)
+
+            // Chat: the conversation sits above the question field, which stays at the
+            // bottom for follow-ups. The Ask row keeps the same place in the view tree in
+            // both modes, so switching modes keeps its focus and typed text.
+            if model.askMode == .chat {
+                ChatConversation(model: model)
+                    .frame(maxHeight: .infinity)
+                    .transition(.opacity)
+            }
 
             AskRow(model: model, questionFocused: $questionFocused)
                 // Global Ask shortcut: the panel is already key; move focus into the field.
@@ -296,7 +312,7 @@ private struct ExpandedContent: View {
                     Task { questionFocused = true }
                 }
 
-            if model.askPhase != .idle {
+            if model.askMode == .once && model.askPhase != .idle {
                 AskOutput(model: model, height: outputHeight)
                     .transition(.opacity)
             }
@@ -314,8 +330,9 @@ private struct ExpandedContent: View {
             }
             .font(.system(size: 11, weight: .medium))
             .foregroundStyle(secondary)
-            // Pinned to the bottom edge of the fixed-height content (no extra stack gap).
-            .frame(maxHeight: .infinity, alignment: .bottom)
+            // Pinned to the bottom edge of the fixed-height content (no extra stack gap); in
+            // Chat the conversation takes up the slack instead.
+            .frame(maxHeight: model.askMode == .chat ? nil : .infinity, alignment: .bottom)
         }
     }
 

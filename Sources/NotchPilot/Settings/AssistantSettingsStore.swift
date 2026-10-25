@@ -29,6 +29,9 @@ final class AssistantSettingsStore {
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private var persistTask: Task<Void, Never>?
     @ObservationIgnored private let keyStore: any APIKeyStoring
+    /// Bumped by every key save or removal, so a background refresh that started earlier
+    /// can't overwrite the newer state with what it read.
+    @ObservationIgnored private var keyGeneration = 0
 
     init(defaults: UserDefaults = .standard, keyStore: any APIKeyStoring) {
         self.defaults = defaults
@@ -69,17 +72,44 @@ final class AssistantSettingsStore {
         savedKeys = saved
     }
 
+    /// Same as `refreshSavedKeys()`, but the Keychain reads run off the main actor: with
+    /// ad-hoc signing a read can show a system access prompt and wait for the person, which
+    /// must not stall the UI (used by the setup guide, which opens at first launch).
+    func refreshSavedKeysInBackground() async {
+        let keyStore = keyStore
+        let generation = keyGeneration
+        let (saved, error) = await Task.detached(priority: .userInitiated) { () -> (Set<AIProvider>, AssistantError?) in
+            var saved: Set<AIProvider> = []
+            var failure: AssistantError?
+            for provider in AIProvider.allCases {
+                do {
+                    if let key = try keyStore.apiKey(for: provider), !key.isEmpty { saved.insert(provider) }
+                } catch let error as AssistantError {
+                    failure = error
+                } catch {
+                    failure = .keychain(errSecInternalError)
+                }
+            }
+            return (saved, failure)
+        }.value
+        guard generation == keyGeneration else { return }
+        savedKeys = saved
+        keyError = error
+    }
+
     /// Returns true when the key was stored.
     @discardableResult
     func saveKey(_ key: String, for provider: AIProvider) -> Bool {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
+        keyGeneration += 1
         guard perform({ try keyStore.setAPIKey(trimmed, for: provider) }) else { return false }
         savedKeys.insert(provider)
         return true
     }
 
     func removeKey(for provider: AIProvider) {
+        keyGeneration += 1
         if perform({ try keyStore.removeAPIKey(for: provider) }) { savedKeys.remove(provider) }
     }
 

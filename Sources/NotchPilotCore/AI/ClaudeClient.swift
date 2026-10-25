@@ -30,17 +30,20 @@ public struct ClaudeClient: ReplyGenerating {
         return ProviderHTTP.replyStream(urlRequest, session: session, provider: provider, decoder: StreamDecoder())
     }
 
+    /// Chat history as text-only messages, then the new user turn (screenshot first).
     static func body(for request: ReplyRequest, settings: AssistantSettings) -> MessageRequest {
+        var messages = request.history.map { MessageRequest.Message(role: $0.role.rawValue, content: [.text($0.text)]) }
         var content: [ContentBlock] = []
         if let jpeg = request.screenshotJPEG {
             content.append(.image(base64JPEG: jpeg.base64EncodedString()))
         }
         content.append(.text(ProviderHTTP.composedText(for: request)))
+        messages.append(.init(role: "user", content: content))
         return MessageRequest(
             model: settings.claudeModel,
             maxTokens: maxTokens,
             system: request.systemPrompt,
-            messages: [.init(role: "user", content: content)],
+            messages: messages,
             outputConfig: .init(effort: settings.claudeEffort),
             fallbacks: "default"
         )

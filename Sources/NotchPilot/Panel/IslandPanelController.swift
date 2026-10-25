@@ -29,6 +29,7 @@ final class IslandPanelController: IslandPanelHosting {
         panel.onCancel = { [weak model] in model?.setPresentation(.compact) }
 
         model.panelHost = self
+        model.undoManager = panel.undoManager
         refreshGeometry()
 
         screenObserver = NotificationCenter.default.addObserver(
@@ -68,6 +69,9 @@ final class IslandPanelController: IslandPanelHosting {
         } else {
             removeOutsideClickMonitor()
             relinquishKeyStatus()
+            // However it closed (shortcut, Esc, click outside, header), the next press
+            // starts fresh rather than counting as a double press.
+            pressRouter.reset()
         }
     }
 
@@ -100,23 +104,75 @@ final class IslandPanelController: IslandPanelHosting {
 
     // MARK: Quick Ask (global shortcut and the status menu's Ask item)
 
-    /// Opens the island expanded with the question field focused, or, if a quick Ask is
-    /// already open, closes it (which hands keyboard focus back to the previous app).
-    func toggleQuickAsk() {
-        if panel.isVisible, panel.isKeyWindow, model.presentation == .expanded {
-            model.setPresentation(.compact)
-        } else {
+    /// Tells a quick second press of the shortcut from a separate one.
+    private var pressRouter = QuickAskPressRouter(interval: DoublePressDetector.interval(
+        systemDoubleClickInterval: NSEvent.doubleClickInterval))
+
+    /// The global Ask shortcut: one press opens the island at once (in the mode
+    /// `QuickAskPressRouter.modeForOpening` picks); a quick second press switches it to the
+    /// other mode (keeping the field focused and any typed text); a later press closes it,
+    /// which hands keyboard focus back to the previous app. Expanded but not taking
+    /// keystrokes (opened by a click): a press just focuses the field, in the mode shown.
+    func handleAskHotKey() {
+        let settings = model.settingsStore.settings
+        // Read on every press: the person may change it in System Settings at any time.
+        pressRouter.interval = DoublePressDetector.interval(systemDoubleClickInterval: NSEvent.doubleClickInterval)
+        let isOpen = panel.isVisible && panel.isKeyWindow && model.presentation == .expanded
+        switch pressRouter.press(at: .now, isOpen: isOpen, doublePressEnabled: settings.askHotKeyDoublePress) {
+        case .open:
             beginQuickAsk()
+        case .switchMode:
+            if !model.setAskMode(model.askMode.other) { refuseModeChange() }
+            model.requestQuestionFocus()
+        case .close:
+            model.setPresentation(.compact)
         }
     }
 
-    /// The panel stays non-activating: it becomes key so the field takes typing, while the
-    /// frontmost app stays active.
+    /// Opens the island expanded with the question field focused (shortcut and the status
+    /// menu's Ask item). From collapsed it shows the "one press opens" mode, or Chat when a
+    /// chat reply arrived meanwhile; already expanded, it keeps the mode on screen. The panel
+    /// stays non-activating: it becomes key so the field takes typing, while the frontmost
+    /// app stays active.
     func beginQuickAsk() {
+        let mode = QuickAskPressRouter.modeForOpening(
+            singlePress: model.settingsStore.settings.askHotKeySinglePress, current: model.askMode,
+            isExpanded: panel.isVisible && model.presentation == .expanded,
+            hasUnseenChatReply: model.hasUnseenChatReply)
+        // While a reply is in progress the mode can't change: open as it is, and say so.
+        if !model.setAskMode(mode) { refuseModeChange() }
         show()
         model.setPresentation(.expanded)
         panel.makeKey()
         model.requestQuestionFocus()
+    }
+
+    /// Status menu's Ask Once / Chat items: switch the mode and show it.
+    func showMode(_ mode: AskMode) {
+        if !model.setAskMode(mode) { refuseModeChange() }
+        show()
+        model.setPresentation(.expanded)
+    }
+
+    /// Status menu's New Chat: clear the chat and show the island with its Undo notice.
+    func newChat() {
+        model.newChat()
+        show()
+        model.setPresentation(.expanded)
+    }
+
+    /// The mode can't change while a reply is in progress: an alert sound plus a spoken
+    /// reason, instead of silently ignoring the request.
+    private func refuseModeChange() {
+        NSSound.beep()
+        AccessibilityNotification.Announcement("Mode unchanged while a reply is in progress").post()
+    }
+
+    /// Status menu's Summarize Transcript: shows the island and sends the summary request.
+    func summarize() {
+        show()
+        model.setPresentation(.expanded)
+        model.summarize()
     }
 
     // MARK: Geometry

@@ -46,7 +46,7 @@ scripts/build.sh --debug    # debug build (enables the C++ ownership asserts)
 scripts/build.sh --run      # build, then launch the app
 scripts/build-whisper.sh     # build Vendor/whisper.xcframework from pinned source (build.sh/test.sh run it when missing)
 scripts/build.sh --help
-scripts/test.sh             # swift test (172 Swift tests) + C++ tests under TSan and ASan/UBSan
+scripts/test.sh             # swift test (229 Swift tests) + C++ tests under TSan and ASan/UBSan
 scripts/test.sh --cpp-only  # C++ tests only
 ```
 
@@ -76,7 +76,7 @@ Raw SwiftPM equivalents:
 swift build                 # debug
 swift build -c release
 swift run NotchPilot        # runs the bare executable (no app bundle)
-swift test                  # Swift tests (NotchPilotCoreTests, 172 tests)
+swift test                  # Swift tests (NotchPilotCoreTests, 229 tests)
 ```
 
 `swift run` works for UI work because `main.swift` sets the `.accessory` activation policy itself. For a stable TCC identity use the bundled app from `scripts/build.sh`.
@@ -106,7 +106,9 @@ Sources/
     Assistant/AssistantInterfaces.swift  AIProvider, AssistantSettings, ReplyRequest, AssistantReply,
                                          AssistantError, Transcript, TranscriptionState, protocols
     Assistant/ReplyTextCoalescer.swift   batches streamed deltas to ~30 UI updates per second
+    Assistant/SummaryEligibility.swift   when the island offers Summarize (≥ 30 words, capture stopped)
     Input/HotKeyFormatting.swift         HotKey glyphs (⌃⌥⇧⌘), spoken form, validation
+    Input/DoublePressDetector.swift      quick second press of the Ask shortcut, QuickAskPressRouter
     Speech/WhisperTranscriber.swift      PCMBlockProcessor; whisper.cpp inference off the audio path
     Speech/WhisperWindowing.swift        rolling 16 kHz window, RMS speech detection, commit rules,
                                          hallucination filter (pure, unit-tested)
@@ -126,6 +128,7 @@ Sources/
     Input/HotKeyCenter.swift         global Ask shortcut (Carbon RegisterEventHotKey)
     Panel/NotchPanel.swift, IslandPanelController.swift
     Island/IslandViewModel.swift, IslandView.swift, IslandShape.swift, AssistantViews.swift
+    Island/ChatViews.swift           mode row (Ask Once / Chat), Chat conversation
 Tests/
   NotchPilotCoreTests/           Swift Testing
   cpp/ring_buffer_tests.cpp      standalone C++ tests (no framework)
@@ -279,6 +282,20 @@ The model file is read into private anonymous memory that is unmapped right afte
 5. While text arrives the header shows a spinner and **Stop**. Stop ends the request and keeps the text so far (marked "Stopped"). When the reply is complete the same spot shows **Copy** and Dismiss; "Reply cut off at the length limit" marks a truncated reply. A refusal mid-stream discards the partial text and shows "No Reply".
 6. VoiceOver announces "<provider> replied" once, when the reply is complete, never per delta; the streaming text carries the `updatesFrequently` trait.
 
+**Ask Once and Chat.** A segmented control under the transcript switches the island between **Ask Once** (one question, one reply, as above) and **Chat** (`AskMode`, `IslandViewModel.askMode`); ⌘1 and ⌘2 do the same while the island is key, and the status menu lists both as a checked pair under Ask. Switching is disabled while an Ask runs. In Chat the island is taller (`expandedChatHeight`) and shows the conversation in an inset container, with the question field below it for follow-ups. On a screen too short for that (`IslandGeometry.chatUsesCompactRows`: the conversation would get less than `minimumChatConversationHeight`), Chat hides the level bar and live transcript so the conversation and the field still fit:
+
+- Your turns sit on the trailing side in a quiet filled bubble (white 14% over the 8% container, about #353535, primary text 10.6:1); a turn without a question reads "About the transcript", a summary "Summarize the transcript", and "With screenshot" marks a turn that included the screen. Replies run full width under a source line naming the provider and model ("Stopped" / "Cut off at the length limit" when it applies). The latest reply has **Copy**; every turn has Copy in its context menu and as a VoiceOver action, and the text is selectable. VoiceOver reads source lines with commas instead of "·".
+- The turn in progress appears at the end: "Capturing Screen…" or "Waiting for <provider>…" with **Cancel**, then the streaming reply with **Stop** (both ⌘.). The conversation follows new text unless you scroll up; sending a question returns to the end. Scrolling is never animated.
+- Each send includes the recent transcript in the new turn and the earlier turns as `ReplyRequest.history` (`ChatSession.history`, trimmed by `ReplyService` with `ChatHistory`). The field clears when you send. Stop keeps the partial reply as the turn. A turn that doesn't complete (Cancel, a refused or failed reply, Stop before any text, or a reply with no text, which shows "Unexpected Reply" instead of announcing a reply) removes the pending turn so the history stays alternating, and puts your question and Include Screen choice back if the field is still empty. The turn lifecycle is a pure, unit-tested type (`ChatThread`).
+- Include Screen applies to one turn: the screenshot goes only with that turn (history is text only), and the toggle returns to its default after each question.
+- **New Chat** (⌘N while the island is key, or the status menu) clears the conversation. It is disabled while a reply is in progress. It can be undone: **Edit › Undo New Chat** (⌘Z) or the "Chat cleared · Undo" notice shown for about 5 seconds; the next question makes the clear final. The chat lives in memory only, until New Chat or quit, and is never saved.
+- Switching from Ask Once to Chat while a one-time reply is showing carries that question and reply into the chat when the chat is empty, so you can follow up on it; otherwise the one-time reply stays in Ask Once. Switching back to Ask Once keeps the chat for later.
+- VoiceOver hears one announcement per reply, as in Ask Once. A reply that finishes while the island is collapsed shows the reply badge until you expand it.
+
+**Summarize.** When capture stops and the transcript has at least 30 words (`SummaryEligibility`), the mode row offers **Summarize**; the status menu has **Summarize with <provider>** whenever there is transcript text. It sends the transcript with `purpose: .summary` (no question, no screenshot even with Include Screen on, and no chat history even in Chat, so the summary covers the transcript only) and streams the summary like a reply: labelled "Summary · <provider>" in Ask Once, or as a turn of the conversation in Chat, where it becomes part of the history for later follow-ups. It is never sent automatically.
+
+**Ask shortcut: one press or two.** One press opens the island at once in the mode chosen under Settings › General › "One press opens" (`askHotKeySinglePress`, Ask Once by default); it never waits to see whether a second press follows. A second press within the double-press interval switches the open island to the other mode, keeping the field focused and anything you typed (`askHotKeyDoublePress`, on by default). Any later press closes the island; closing by any path (Esc, click outside, header) resets the detector, so the next press opens. When the island is collapsed, a press opens the one-press mode, or Chat if a chat reply arrived while it was collapsed. When it is already expanded but not taking keystrokes (opened by a click), a press only focuses the field and keeps the mode shown. While a reply is in progress the mode can't change: the press opens or focuses the island as it is, with an alert sound and a VoiceOver announcement. The interval is the system double-click speed (`NSEvent.doubleClickInterval`, System Settings › Accessibility › Pointer Control) clamped to 0.2–0.5 s, read on each press. The logic is pure and unit tested (`DoublePressDetector`, `QuickAskPressRouter`, `QuickAskPressRouter.modeForOpening`); `IslandPanelController.handleAskHotKey()` applies it. The status menu's Ask item picks the mode the same way.
+
 ### What is sent per request
 
 Exactly one HTTPS request to the provider you chose:
@@ -286,11 +303,12 @@ Exactly one HTTPS request to the provider you chose:
 | Part | Content |
 |---|---|
 | Transcript | `Transcript.recentText(limit:)`: the last `transcriptCharacterLimit` characters (default 6000), cut at a word boundary |
-| Question | Optional text from the question field; without one, the prompt asks the model to respond to what is being said |
+| Question | Optional text from the question field; without one, the prompt asks the model to respond to what is being said. Summarize sends no question |
 | System prompt | `AssistantSettings.systemPrompt` |
-| Screenshot | Only if Include Screen is on: one JPEG of the main display, long edge at most 1568 px, quality 0.7, NotchPilot's own windows excluded, cursor hidden |
+| Chat history | Chat only, not Summarize: earlier turns of the current chat as text-only messages (no transcripts, no screenshots), newest whole question/reply pairs within `ChatHistory.maxTurns` (20) turns and what is left of `ChatHistory.maxCharacters` (24,000) after the new transcript and question. Ask-without-a-question and Summarize turns are recorded as `(Asked about the transcript at the time)` / `(Asked for a summary of the transcript at the time)`. Held in memory only, cleared by New Chat or quitting |
+| Screenshot | Only if Include Screen is on and not for Summarize: one JPEG of the main display, long edge at most 1568 px, quality 0.7, NotchPilot's own windows excluded, cursor hidden |
 
-The user text is `Transcript of audio playing on my Mac (most recent last):` followed by the transcript, then `My question: ...` or `Respond helpfully to what's being said.` Requests use an ephemeral `URLSession` with no cache and a 600 s idle timeout (the longest wait for the next streamed bytes). Replies stream as Server-Sent Events (`"stream": true`); a refusal partway through discards the partial text. Nothing is logged: not keys, transcripts, bodies or screenshots.
+The user text is `Transcript of audio playing on my Mac (most recent last):` followed by the transcript, then `My question: ...`, `Respond helpfully to what's being said.`, or for Summarize a fixed instruction asking for a one-line gist, key points, decisions, action items and open questions in the transcript's language (`ProviderHTTP.composedText`). **Check Key** in the setup guide sends a separate fixed request: `APIKeyCheck.systemPrompt`, the question `OK?`, no transcript, history or screenshot. Requests use an ephemeral `URLSession` with no cache and a 600 s idle timeout (the longest wait for the next streamed bytes). Replies stream as Server-Sent Events (`"stream": true`); a refusal partway through discards the partial text. Nothing is logged: not keys, transcripts, bodies or screenshots.
 
 ### Claude (Anthropic Messages API)
 
@@ -336,6 +354,18 @@ Screenshot failures (`ScreenshotError`: `permissionDenied`, `noDisplay`, `captur
 
 Cancel (while capturing the screen or waiting) cancels the Ask task (`cancelAsk`) and the island returns to idle without an error. Stop (while text streams) cancels the task too but keeps the text received so far (`stopReply`). Cancelling the task ends the reply stream, which cancels the HTTP request. Every Ask has an ID and only the current one may change the island's state, so a cancelled or superseded stream can never overwrite a newer Ask. Ask is ignored while another Ask is running.
 
+## First run
+
+On first launch (while `AssistantSettings.hasCompletedSetup` is false) NotchPilot opens a small **NotchPilot Setup** window next to the island. It is a standard titled window, not part of the island, and can be reopened at any time from the status menu (**Setup Guide...**). Each step shows live status (a numbered badge that turns into a checkmark and the word "Done"); status is re-read when the window becomes key and every 2 seconds while it is open, and the model download is observed directly.
+
+1. **Screen & System Audio Recording.** Explains in plain words that NotchPilot turns the sound the Mac plays into text, never uses the microphone and records nothing, and that macOS may ask to quit and reopen NotchPilot after allowing it. **Request Access...** calls `CGRequestScreenCaptureAccess()`, which shows the system prompt once; after that the step offers **Open Privacy Settings**. The guide never tries to grant or bypass the permission.
+2. **Speech Model.** **Download Speech Model (148 MB)** (size from the catalog; the selected model, "Base model, recommended for this Mac" by default) with determinate progress and **Cancel**, through the same `SpeechModelsController` as Settings › Speech, so the download continues if the window closes.
+3. **AI Provider Key.** Choose Claude or ChatGPT and paste the key, with a link to the provider's key page and three short steps (sign in, add pay-per-use billing, create a key). The key is saved through the same store and Keychain path as Settings › Assistant and never shown again. An unsaved draft is cleared when you switch provider or close the window, and kept after a failed save so you can retry. Once a key is saved, **Check Key** (only when pressed) sends one minimal test request through the normal Ask path: a fixed one-word prompt, no transcript, no screenshot, no history, low effort, and the stream is cancelled as soon as the provider starts replying. It shows "Key works" or the usual error message. The step also states what Ask and Summarize send.
+
+The footer, always in view, shows the configured Ask shortcut and how one press and two quick presses behave (from `askHotKeySinglePress` / `askHotKeyDoublePress`), an optional **Open NotchPilot at login** checkbox (unchecked by default; the same `LoginItemController` as Settings › General), the number of steps done and **Done**. The window is sized to fit in about 720 pt, so nothing is below the fold on a 13-inch MacBook Air.
+
+**Done**, Esc and the window's close button all mark setup as seen (`hasCompletedSetup = true`), so the guide doesn't return on the next launch (HIG › Onboarding: don't present a skipped tutorial again, but keep it easy to find). Quitting NotchPilot while the guide is open does not mark it. The pure step logic lives in `NotchPilotCore/Setup/SetupChecklist.swift` and is unit tested.
+
 ## Settings window
 
 Open it from the status menu (**Settings...**) or with Command-comma. It has three panes in a toolbar (General, Assistant, Speech); the window is titled after the pane, sized to it, close button only, and reopens on the pane you viewed last. "Open Settings" in the island opens the pane that fixes the problem (Assistant for key or model errors, Speech when no speech model is downloaded).
@@ -345,8 +375,11 @@ Open it from the status menu (**Settings...**) or with Command-comma. It has thr
 | Field | Meaning |
 |---|---|
 | Ask from any app | Turns the global Ask shortcut on or off (`askHotKeyEnabled`) |
+| One press opens | Ask Once or Chat: the mode one press of the shortcut opens (`askHotKeySinglePress`) |
+| Press twice quickly for <other mode> | A quick second press switches the open island to the other mode (`askHotKeyDoublePress`, on by default). Uses the system double-click speed, clamped to 0.2–0.5 s |
 | Shortcut | Recorder: click it, press the new combination, Esc cancels. It needs ⌘, ⌥ or ⌃ (function keys may go without), can't be Esc/Return/Tab/Delete, and standard macOS shortcuts (⌘Space, ⌃Space, ⌃⌥Space, ⌘Tab, ⇧⌘3/4/5, ⌘C/V/X/Z/A, ⌘Q, …) are refused with the reason. Shown as ⌃⌥⇧⌘ glyphs, character keys named as the current keyboard layout prints them. **Restore Default** returns to `HotKey.defaultAsk`. If macOS reports that another app already registered the combination, the reason is shown under it and the shortcut is inactive |
 | Include screen by default | Initial state of the Include Screen toggle |
+| Open NotchPilot at login | Off by default. Registers or unregisters the app with `SMAppService.mainApp`; the switch always reflects the service's own status (it is not stored in settings), so changes made in System Settings › General › Login Items show up too. If macOS reports `.requiresApproval`, a hint and an **Open Login Items** button (`SMAppService.openSystemSettingsLoginItems()`) appear. If macOS can't find the app (`.notFound`, for example when it runs from a disk image or Downloads), it explains how to move NotchPilot to the Applications folder. Opening at login only starts NotchPilot in the menu bar; capture stays off |
 
 **Assistant**
 
@@ -370,7 +403,7 @@ Below the prompt the pane states what leaves the Mac and when (see [privacy](#pe
 
 Changing model or language restarts transcription if capture is running. The footer reads: "Speech is transcribed on this Mac. Downloading a model fetches it once from huggingface.co." (The download goes to huggingface.co and its CDN, *.hf.co.)
 
-**Storage.** API keys go to the Keychain: generic password, service `app.notchpilot.apikeys`, account `claude` or `openAI`, stored in the user's login keychain. The item sets `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, but the file-based login keychain does not enforce that attribute: an ad-hoc-signed build cannot use the data-protection keychain, so access is governed by the item's ACL and macOS asks you before any other app reads it. The key is not device-bound. A Developer-ID-signed release could add `kSecUseDataProtectionKeychain` for that. Everything else in `AssistantSettings` is stored as JSON in `UserDefaults` under the key `AssistantSettings`. The Keychain is touched only when Settings opens or when you Ask or save a key, not at launch.
+**Storage.** API keys go to the Keychain: generic password, service `app.notchpilot.apikeys`, account `claude` or `openAI`, stored in the user's login keychain. The item sets `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, but the file-based login keychain does not enforce that attribute: an ad-hoc-signed build cannot use the data-protection keychain, so access is governed by the item's ACL and macOS asks you before any other app reads it. The key is not device-bound. A Developer-ID-signed release could add `kSecUseDataProtectionKeychain` for that. Everything else in `AssistantSettings` is stored as JSON in `UserDefaults` under the key `AssistantSettings`. The Keychain is touched only when Settings or the setup guide opens (the guide opens by itself on first launch only) or when you Ask or save a key; later launches don't touch it.
 
 ## Window behaviour
 
@@ -401,11 +434,11 @@ Changing model or language restarts transcription if capture is running. The foo
 | Input | Result |
 |---|---|
 | Click the island header | Expand or collapse |
-| Ask shortcut (global) | Shows the island expanded, makes the non-activating panel key and focuses the question field; the app you were using stays active. Pressing it again collapses. Registered with Carbon `RegisterEventHotKey` (`HotKeyCenter`), which needs no Accessibility permission and sees no other keystrokes. While the Settings recorder listens, the shortcut is unregistered so it can be recorded |
+| Ask shortcut (global) | Shows the island expanded (in the one-press mode, or Chat for an unseen chat reply; an island that is already expanded keeps its mode), makes the non-activating panel key and focuses the question field; the app you were using stays active. A quick second press switches to the other mode (Ask Once / Chat); a later press collapses. Registered with Carbon `RegisterEventHotKey` (`HotKeyCenter`), which needs no Accessibility permission and sees no other keystrokes. While the Settings recorder listens, the shortcut is unregistered so it can be recorded |
 | Escape (while the panel is key) | Collapse. Only the Ask shortcut, the menu's Ask and "Show Controls" items, or clicking the question field make the non-activating panel key (NotchPilot is not activated); background updates never do, and collapsing hands key status back to the frontmost app. |
 | Click outside | Collapse. A global mouse-down monitor is installed only while expanded; it observes events and cannot modify or consume them. |
 | Question field | Click to type. The panel becomes key without activating NotchPilot (`NotchPanel.canBecomeKey`, `IslandViewModel.beginTyping`), so the frontmost app stays active |
-| Menu-bar item | Start/Stop Capture (Cmd-R in the open menu), Show Controls, Show/Hide Island, Ask <provider>... (same as the Ask shortcut, which it shows right-aligned), Clear Transcript, Settings... (Cmd-comma), Open Privacy Settings, Quit |
+| Menu-bar item | Start/Stop Capture (Cmd-R in the open menu), Show Controls, Show/Hide Island, Ask <provider>... (same as the Ask shortcut, which it shows right-aligned), Ask Once / Chat (checked pair), New Chat (⌘N shown; enabled when there is a chat and no reply in progress), Summarize with <provider> (enabled when there is transcript text), Clear Transcript, Settings... (Cmd-comma), Open Privacy Settings, Quit |
 | Hover | Expands after `hoverExpandDelay` only if `expandOnHover` is enabled (off by default) |
 
 **Editing keys and Settings.** An `.accessory` app has no visible main menu, but AppKit still routes key equivalents through it. `MainMenu` installs a hidden main menu with an Edit menu (Undo, Redo, Cut, Copy, Paste, Select All) so Command-C/V work in the question field and when pasting an API key, plus Settings... and Quit. Opening Settings activates the app temporarily (`NSApp.activate()`); closing the window deactivates it again, which hands focus back to the previous app.
@@ -441,9 +474,11 @@ All tunables live in `NotchPilotConfig` (`Sources/NotchPilotCore/Config/NotchPil
 | `compactWingWidth` | 40 | Width of each side wing flanking the camera housing in compact state |
 | `compactSizeWithoutNotch` | 200 x 32 | Compact size on displays without a camera housing |
 | `minimumNotchHeight` | 32 | Fallback compact height if a notched display reports no safe-area inset |
-| `expandedContentSize` | 460 x 208 | Expanded content area, measured below the housing / top edge: status, level bar, live transcript, Ask row and footer |
+| `expandedContentSize` | 460 x 236 | Expanded content area, measured below the housing / top edge: status, level bar, live transcript, mode row (Ask Once / Chat, Summarize, New Chat), Ask row and footer |
 | `expandedNoticeHeight` | 74 | Extra expanded height while an Ask is in progress or has failed |
 | `expandedReplyHeight` | 140 | Extra expanded height while a reply is shown (about five lines) |
+| `minimumChatConversationHeight` | 120 | Smallest conversation worth showing; below it (short screens) Chat hides the level bar and live transcript |
+| `expandedChatHeight` | 248 | Extra expanded height in Chat mode for the conversation, constant so the island doesn't change height turn by turn. About 520 pt in all below a notch, which fits a 13-inch MacBook Air at 1440 x 900 with the Dock showing; on shorter screens the island is clamped to the visible height and the conversation gets what is left |
 | `compactCornerRadius` | 12 | Bottom corner radius, compact |
 | `expandedCornerRadius` | 24 | Bottom corner radius, expanded |
 | `shoulderRadius` | 8 | Concave shoulder radius where a notch-attached island meets the menu bar |
@@ -509,7 +544,7 @@ Not part of `NotchPilotConfig`: these are runtime preferences edited in the [Set
 - **Own audio excluded** (`excludesCurrentProcessAudio`, on by default).
 - **Transcription never leaves the Mac.** whisper.cpp runs inside NotchPilot; audio is held only in a rolling in-memory window (at most about 30 s, normally under 15 s) and is never written to disk or sent anywhere.
 - **Speech model download** is the only other network use: when you click Download in Settings › Speech, the model file is fetched once from `huggingface.co` and its CDN (`*.hf.co`), from a URL pinned to one repository commit, and accepted only if its SHA-256 matches the value built into the app. The same hash is checked again over the exact bytes whisper loads, each time a model is loaded.
-- **Network: Ask and model download only.** Ask goes only to the provider you chose (`api.anthropic.com` or `api.openai.com`). One request contains the recent transcript, your optional question, the system prompt and, only if Include Screen is on, one screenshot. Apart from the model download above, there is no analytics and no other network use.
+- **Network: Ask, Check Key and model download only.** Ask goes only to the provider you chose (`api.anthropic.com` or `api.openai.com`). One request contains the recent transcript, your optional question, the system prompt and, only if Include Screen is on, one screenshot. **Check Key** in the setup guide sends one minimal request to the chosen provider, only when you press it (a fixed one-word prompt; no transcript, screenshot or history). Apart from these and the model download above, there is no analytics and no other network use.
 - **Screenshot** only when Include Screen is on and you press Ask. It is JPEG-encoded in memory, sent in that request, and never saved.
 - **API keys** are in your login keychain. They are not device-bound: macOS asks before another app reads them (see [Settings window](#settings-window)).
 - **Nothing is logged** (keys, transcripts, request bodies, screenshots). Both HTTP sessions are ephemeral: the provider session has no cache, and the model-download session has no URL cache and no cookie storage. Audio, transcripts, screenshots and replies exist only in memory. `UserDefaults` holds only the non-secret `AssistantSettings` JSON and the last-viewed Settings pane.
@@ -520,8 +555,8 @@ Not part of `NotchPilotConfig`: these are runtime preferences edited in the [Set
 
 | Permission | Used for | When it is requested |
 |---|---|---|
-| Screen & System Audio Recording | System audio capture; the optional screenshot | Capture: when you start capture (listing shareable content). Screenshot: `ScreenshotCapturer` checks `CGPreflightScreenCaptureAccess()` and reports `permissionDenied` rather than prompting |
-| Keychain | Storing API keys | When you save, read or remove a key (opening Settings, saving a key, Ask). Not at launch. With ad-hoc signing macOS may ask to allow access |
+| Screen & System Audio Recording | System audio capture; the optional screenshot | Capture: when you start capture (listing shareable content). Setup guide: only when you press **Request Access...** (`CGRequestScreenCaptureAccess()`, which shows the system prompt once). Screenshot: `ScreenshotCapturer` checks `CGPreflightScreenCaptureAccess()` and reports `permissionDenied` rather than prompting |
+| Keychain | Storing API keys | When you save, read or remove a key (opening Settings or the setup guide, saving a key, Ask). Not at launch, except that the setup guide checks for a saved key when it opens on first launch. With ad-hoc signing macOS may ask to allow access |
 
 **Permission flow.** Starting capture triggers the Screen & System Audio Recording prompt. If access is denied, the island shows "Permission Needed" with an **Open Privacy Settings** button, and the menu offers the same item. Manual path: System Settings > Privacy & Security > Screen & System Audio Recording, enable NotchPilot, then start capture again. macOS may periodically ask you to re-confirm the screen permission.
 
@@ -530,7 +565,7 @@ Not part of `NotchPilotConfig`: these are runtime preferences edited in the [Set
 - The interactive capture and permission (TCC) flow needs a human on a Mac; it is not covered by automated tests.
 - With ad-hoc signing the code identity changes on every rebuild, so macOS may ask for permission again.
 - ScreenCaptureKit requires a display content filter to deliver system audio, so a 2x2 px, at most 1 fps video stream exists. NotchPilot registers no screen output and discards that video.
-- Real calls to the Anthropic and OpenAI APIs, TCC prompts (Screen & System Audio Recording), Keychain prompts with ad-hoc signing, and transcription accuracy per language are not verified by automated tests. The tests cover 172 Swift tests plus the C++ suite under TSan and ASan/UBSan.
+- Real calls to the Anthropic and OpenAI APIs, TCC prompts (Screen & System Audio Recording), Keychain prompts with ad-hoc signing, and transcription accuracy per language are not verified by automated tests. The tests cover 229 Swift tests plus the C++ suite under TSan and ASan/UBSan.
 - whisper.cpp output for real audio is checked by one opt-in test (`NOTCHPILOT_WHISPER_INTEGRATION=1 swift test --filter WhisperIntegrationTests` downloads Tiny and transcribes speech made with `say`); it is skipped by default.
 - Transcription has not been run on an 8 GB M1 Mac; memory figures were measured on a 10-core Apple silicon Mac.
 - Streaming is approximate: partial text can change as more of the utterance arrives, and a 15 s window can cut a word.

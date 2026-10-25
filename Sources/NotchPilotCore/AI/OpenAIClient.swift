@@ -27,15 +27,22 @@ public struct OpenAIClient: ReplyGenerating {
         return ProviderHTTP.replyStream(urlRequest, session: session, provider: provider, decoder: StreamDecoder())
     }
 
+    /// System prompt, chat history as text-only messages, then the new user turn.
     static func body(for request: ReplyRequest, settings: AssistantSettings) -> CompletionRequest {
         var parts: [UserPart] = [.text(ProviderHTTP.composedText(for: request))]
         if let jpeg = request.screenshotJPEG {
             parts.append(.imageURL("data:image/jpeg;base64,\(jpeg.base64EncodedString())"))
         }
+        let history: [Message] = request.history.map { turn in
+            switch turn.role {
+            case .user: .user([.text(turn.text)])
+            case .assistant: .assistant(turn.text)
+            }
+        }
         return CompletionRequest(
             model: settings.openAIModel,
             maxCompletionTokens: maxCompletionTokens,
-            messages: [.system(request.systemPrompt), .user(parts)]
+            messages: [.system(request.systemPrompt)] + history + [.user(parts)]
         )
     }
 
@@ -56,6 +63,7 @@ public struct OpenAIClient: ReplyGenerating {
     enum Message: Encodable {
         case system(String)
         case user([UserPart])
+        case assistant(String)
 
         private enum CodingKeys: String, CodingKey { case role, content }
 
@@ -64,6 +72,9 @@ public struct OpenAIClient: ReplyGenerating {
             switch self {
             case .system(let text):
                 try container.encode("system", forKey: .role)
+                try container.encode(text, forKey: .content)
+            case .assistant(let text):
+                try container.encode("assistant", forKey: .role)
                 try container.encode(text, forKey: .content)
             case .user(let parts):
                 try container.encode("user", forKey: .role)

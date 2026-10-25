@@ -75,6 +75,16 @@ public struct IslandGeometry: Sendable, Equatable {
         return CGSize(width: min(size.width, maxWidth), height: min(size.height, maxHeight))
     }
 
+    /// Chat on a screen too short for the full island: true when clamping to the display
+    /// takes so much height that the conversation would get less than
+    /// `minimumChatConversationHeight`. The island then hides the level bar and the live
+    /// transcript in Chat, so the conversation and the question field still fit.
+    public var chatUsesCompactRows: Bool {
+        let full = headerHeight + config.expandedContentSize.height + config.expandedChatHeight
+        let shortfall = max(0, full - islandSize(for: .expanded, accessoryHeight: config.expandedChatHeight).height)
+        return config.expandedChatHeight - shortfall < config.minimumChatConversationHeight
+    }
+
     /// Panel frame (global coordinates) that hosts the island for a presentation:
     /// horizontally centred on the display, top edge pinned, padded for the shadow, and
     /// never outside the screen frame.

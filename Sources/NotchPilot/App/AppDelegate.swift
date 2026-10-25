@@ -12,6 +12,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Whisper model downloads; Settings › Speech shows and drives it.
     private(set) var speechModels: SpeechModelStore?
     private var settingsWindow: SettingsWindowController?
+    /// First-run setup guide (lane-setup).
+    private var setupGuide: SetupGuideController?
     private var settingsStore: AssistantSettingsStore?
     private var model: IslandViewModel?
     private var panelController: IslandPanelController?
@@ -38,12 +40,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         speechModelsController.onModelUninstalled = { [weak model, weak settingsStore] id in
             if id == settingsStore?.settings.speechModelID { model?.speechSettingsDidChange() }
         }
-        let settingsWindow = SettingsWindowController(store: settingsStore, speechModels: speechModelsController, hotKeys: hotKeys)
+        let loginItem = LoginItemController()   // one instance for Settings › General and the setup guide
+        let settingsWindow = SettingsWindowController(store: settingsStore, speechModels: speechModelsController, hotKeys: hotKeys,
+                                                      loginItem: loginItem)
         self.settingsStore = settingsStore
         model.openSettings = { [weak settingsWindow] pane in settingsWindow?.show(pane: pane) }
+        let setupGuide = SetupGuideController(store: settingsStore, speechModels: speechModelsController, hotKeys: hotKeys,
+                                              loginItem: loginItem, replyService: ReplyService(keyStore: keyStore),
+                                              openPrivacySettings: { [weak model] in model?.openPrivacySettings() })
 
         // Global Ask shortcut: open the island ready to type; press again to close.
-        hotKeys.onPress = { [weak panelController] in panelController?.toggleQuickAsk() }
+        // One press opens the chosen mode, a quick second press switches to the other one,
+        // a later press closes (IslandPanelController.handleAskHotKey).
+        hotKeys.onPress = { [weak panelController] in panelController?.handleAskHotKey() }
         hotKeys.update(enabled: settingsStore.settings.askHotKeyEnabled, hotKey: settingsStore.settings.askHotKey)
 
         settingsStore.onChange = { [weak model, weak hotKeys] old, new in
@@ -81,8 +90,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return settings.askHotKey
             },
             hasTranscript: { [weak model] in !(model?.transcript.fullText.isEmpty ?? true) },
+            summarize: { [weak panelController] in panelController?.summarize() },
+            canSummarize: { [weak model] in model?.canSummarize ?? false },
+            providerName: { [weak model] in model?.provider.displayName ?? "" },
+            askMode: { [weak model] in model?.askMode ?? .once },
+            canChangeMode: { [weak model] in !(model?.askPhase.isBusy ?? true) },
+            setAskMode: { [weak panelController] mode in panelController?.showMode(mode) },
+            newChat: { [weak panelController] in panelController?.newChat() },
+            canStartNewChat: { [weak model] in model?.canStartNewChat ?? false },
             isIslandVisible: { [weak panelController] in panelController?.isVisible ?? false },
-            captureState: { [weak model] in model?.captureState ?? .idle }))
+            captureState: { [weak model] in model?.captureState ?? .idle },
+            openSetupGuide: { [weak setupGuide] in setupGuide?.show() }))
 
         // Bridge capture events to the UI. Both streams are bounded (newest wins) and are
         // fed from non-real-time code only.
@@ -122,6 +140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.transcriber = transcriber
         self.speechModels = speechModels
         self.settingsWindow = settingsWindow
+        self.setupGuide = setupGuide
         self.model = model
         self.panelController = panelController
         self.statusItem = statusItem
@@ -129,6 +148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.speechModelsController = speechModelsController
         MainMenu.install(settingsTarget: self, settingsAction: #selector(showSettings))
         panelController.show()   // capture stays off until the person starts it
+        setupGuide.showIfNeeded()   // first launch only (hasCompletedSetup == false)
     }
 
     @objc private func showSettings() {
@@ -167,6 +187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         transcriber?.shutdown()   // the whisper model must be freed before exit (see shutdown())
         hotKeys?.invalidate()
         speechModelsController?.invalidate()
+        setupGuide?.invalidate()
         panelController?.invalidate()
     }
 }

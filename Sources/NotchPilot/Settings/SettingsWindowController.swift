@@ -17,13 +17,17 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     private let store: AssistantSettingsStore
     private let hotKeys: HotKeyCenter
+    /// Shared with the setup guide.
+    private let loginItem: LoginItemController
     /// Owned by the app delegate (the island uses it too), so downloads continue while
     /// Settings is closed.
     private let speechModels: SpeechModelsController
     private var window: NSWindow?
     private var tabs: SettingsTabViewController?
 
-    init(store: AssistantSettingsStore, speechModels: SpeechModelsController, hotKeys: HotKeyCenter) {
+    init(store: AssistantSettingsStore, speechModels: SpeechModelsController, hotKeys: HotKeyCenter,
+         loginItem: LoginItemController) {
+        self.loginItem = loginItem
         self.store = store
         self.speechModels = speechModels
         self.hotKeys = hotKeys
@@ -67,7 +71,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     @ViewBuilder private func content(for pane: SettingsPane) -> some View {
         switch pane {
-        case .general: GeneralSettingsPane(store: store, hotKeys: hotKeys)
+        case .general: GeneralSettingsPane(store: store, hotKeys: hotKeys, loginItem: loginItem)
         case .assistant: AssistantSettingsPane(store: store)
         case .speech: SpeechSettingsPane(store: store, models: speechModels)
         }
